@@ -9,5 +9,5 @@ services:
       VENICE_PASSWORD: ${VENICE_PASSWORD}
       VENICE_SESSION_FILE: /data/.venice-web-session.json
     volumes:
-      - ./.venice-web-session.json:/data/.venice-web-session.json
+      - /path/to/venice-session:/data
     restart: unless-stopped
