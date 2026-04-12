@@ -1,0 +1,12 @@
+.git
+.gitignore
+node_modules
+.venice-web-session.json
+*.har
+*.bak
+*.log
+*.jsonl
+venice-conversation*.txt
+venice-conversation*.json
+VENICE_*.md
+import-chat-schema.json
