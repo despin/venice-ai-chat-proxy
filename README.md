@@ -23,6 +23,7 @@ The proxy translates OpenAI-style chat requests into Venice web requests, then t
 ## Requirements
 
 - Node.js 22 or newer
+- Python 3 with `venv` support
 - a Venice account
 - a saved session file, or valid `VENICE_EMAIL` and `VENICE_PASSWORD`
 
@@ -41,6 +42,18 @@ Main scripts in this repo:
 ## Local setup
 
 ### 1. Set credentials
+
+For local testing, edit `venice-login.json`:
+
+```json
+{
+  "VENICE_EMAIL": "you@example.com",
+  "VENICE_PASSWORD": "your-password",
+  "VENICE_SESSION_FILE": ".venice-web-session.json"
+}
+```
+
+Environment variables override values from `venice-login.json`.
 
 PowerShell:
 
@@ -62,7 +75,23 @@ $env:VENICE_PROXY_PORT="3456"
 node .\venice-login.mjs
 ```
 
-This writes `.venice-web-session.json` by default.
+This performs a fresh Clerk credential login without Chrome. It uses Python `curl_cffi` so the HTTP/TLS stack looks like Chrome to Clerk, validates the Venice web session, and writes `.venice-web-session.json` by default.
+
+If `curl_cffi` is not already available, `venice-login.mjs` creates `.venice-login-venv/` and installs it there. To manage the dependency yourself:
+
+```powershell
+python3 -m pip install -r requirements.txt
+```
+
+Optional modes:
+
+```powershell
+node .\venice-login.mjs --restore
+node .\venice-login.mjs --restore-only
+node .\venice-login.mjs --direct
+```
+
+`--restore-only` refreshes from the saved session/cookies and never falls back to credential login. `--restore` keeps the older restore/direct fallback behavior for debugging. `--direct` uses the plain Node fetch implementation, which is useful for confirming Clerk bot/rate rejection but is not the normal login path.
 
 ### 3. Start the proxy locally
 
@@ -128,7 +157,7 @@ docker run --rm -p 3456:3456 `
 Container behavior at startup:
 
 - tries to restore `/data/.venice-web-session.json`
-- if needed, logs in using `VENICE_EMAIL` and `VENICE_PASSWORD`
+- if needed, logs in using the browserless `curl_cffi` Clerk flow with `VENICE_EMAIL` and `VENICE_PASSWORD`
 - persists the refreshed session
 - starts the proxy and keeps it running
 
@@ -184,6 +213,7 @@ The proxy logs:
 
 - This is not the official Venice API.
 - The proxy relies on Venice web auth behavior and may need adjustment if Venice changes its web flow.
+- Fresh login is browserless, but it depends on `curl_cffi` Chrome impersonation because Clerk currently rejects plain Node/curl HTTP fingerprints with 429s.
 - Clerk JWTs are short-lived; the session file is important because it persists cookies needed for restore.
 - The proxy does not perform interactive login during requests.
 - For container startup, login/restore happens once before the server starts.

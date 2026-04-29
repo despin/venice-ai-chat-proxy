@@ -6,19 +6,58 @@ const VENICE_ORIGIN = "https://venice.ai";
 const CLERK_BASE_URL = "https://clerk.venice.ai";
 const OUTFACE_BASE_URL = "https://outerface.venice.ai";
 const CLERK_API_VERSION = "2025-11-10";
-const CLERK_JS_VERSION = "5.125.7";
+const CLERK_JS_VERSION = "5.125.10";
 const DEFAULT_MODEL = "zai-org-glm-4.6";
 const DEFAULT_PROMPT = "Doing inference!";
-const DEFAULT_VENICE_VERSION = "interface@20260411.120332+7e094dd";
-const DEFAULT_MIDDLEFACE_VERSION = "0.1.625";
+const DEFAULT_VENICE_VERSION = "interface@20260429.025033+f3675fb";
+const DEFAULT_MIDDLEFACE_VERSION = "0.1.692";
 const DEFAULT_SESSION_FILE = path.join(process.cwd(), ".venice-web-session.json");
+const LOGIN_CONFIG_FILE = path.join(process.cwd(), "venice-login.json");
 const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+const BROWSER_CLIENT_HINT_HEADERS = {
+  "accept-language": "en-US,en;q=0.9",
+  "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"macOS"',
+};
+const BROWSER_CORS_HEADERS = {
+  ...BROWSER_CLIENT_HINT_HEADERS,
+  "sec-fetch-dest": "empty",
+  "sec-fetch-mode": "cors",
+};
 
-function requiredEnv(name) {
-  const value = process.env[name]?.trim();
+let cachedLoginConfig;
+
+function readLoginConfig() {
+  if (cachedLoginConfig !== undefined) {
+    return cachedLoginConfig;
+  }
+  try {
+    cachedLoginConfig = JSON.parse(fs.readFileSync(LOGIN_CONFIG_FILE, "utf8"));
+  } catch {
+    cachedLoginConfig = {};
+  }
+  return cachedLoginConfig;
+}
+
+function credentialValue(name) {
+  const envValue = process.env[name];
+  if (typeof envValue === "string" && envValue.trim()) {
+    return name.endsWith("PASSWORD") ? envValue : envValue.trim();
+  }
+
+  const fileValue = readLoginConfig()[name];
+  if (typeof fileValue === "string" && fileValue.trim()) {
+    return name.endsWith("PASSWORD") ? fileValue : fileValue.trim();
+  }
+  return "";
+}
+
+function requiredCredential(name) {
+  const value = credentialValue(name);
   if (!value) {
-    throw new Error(`Missing required env var: ${name}`);
+    throw new Error(`Missing required credential: ${name}`);
   }
   return value;
 }
@@ -103,9 +142,12 @@ function stripPort(hostname) {
   return hostname.replace(/:\d+$/, "");
 }
 
-function domainMatches(hostname, cookieDomain) {
+function domainMatches(hostname, cookieDomain, hostOnly = false) {
   const normalizedHost = stripPort(hostname).toLowerCase();
   const normalizedDomain = cookieDomain.replace(/^\./, "").toLowerCase();
+  if (hostOnly) {
+    return normalizedHost === normalizedDomain;
+  }
   return (
     normalizedHost === normalizedDomain || normalizedHost.endsWith(`.${normalizedDomain}`)
   );
@@ -132,7 +174,7 @@ class CookieJar {
         if (cookie.expiresAt != null && cookie.expiresAt <= now) {
           return false;
         }
-        if (!domainMatches(url.hostname, cookie.domain)) {
+        if (!domainMatches(url.hostname, cookie.domain, cookie.hostOnly)) {
           return false;
         }
         return url.pathname.startsWith(cookie.path);
@@ -149,6 +191,7 @@ class CookieJar {
       expiresAt: cookie.expiresAt,
       secure: cookie.secure,
       httpOnly: cookie.httpOnly,
+      hostOnly: cookie.hostOnly,
     }));
   }
 
@@ -169,6 +212,10 @@ class CookieJar {
         path: typeof cookie.path === "string" ? cookie.path : "/",
         secure: Boolean(cookie.secure),
         httpOnly: Boolean(cookie.httpOnly),
+        hostOnly:
+          typeof cookie.hostOnly === "boolean"
+            ? cookie.hostOnly
+            : !String(cookie.domain ?? "").startsWith("."),
         expiresAt:
           typeof cookie.expiresAt === "number" && Number.isFinite(cookie.expiresAt)
             ? cookie.expiresAt
@@ -195,6 +242,7 @@ class CookieJar {
       path: "/",
       secure: false,
       httpOnly: false,
+      hostOnly: true,
       expiresAt: null,
     };
 
@@ -205,6 +253,7 @@ class CookieJar {
       switch (attrName) {
         case "domain":
           record.domain = attrValue || record.domain;
+          record.hostOnly = false;
           break;
         case "path":
           record.path = attrValue || record.path;
@@ -248,11 +297,11 @@ class CookieJar {
 
 export class VeniceWebClient {
   constructor({
-    email = requiredEnv("VENICE_EMAIL"),
-    password = requiredEnv("VENICE_PASSWORD"),
+    email = credentialValue("VENICE_EMAIL"),
+    password = credentialValue("VENICE_PASSWORD"),
     model = process.env.VENICE_MODEL?.trim() || DEFAULT_MODEL,
     prompt = process.env.VENICE_PROMPT?.trim() || DEFAULT_PROMPT,
-    sessionFile = process.env.VENICE_SESSION_FILE?.trim() || DEFAULT_SESSION_FILE,
+    sessionFile = credentialValue("VENICE_SESSION_FILE") || DEFAULT_SESSION_FILE,
     fetchImpl = globalThis.fetch,
   } = {}) {
     if (typeof fetchImpl !== "function") {
@@ -277,6 +326,11 @@ export class VeniceWebClient {
   async request(url, init = {}) {
     const headers = new Headers(init.headers || {});
     headers.set("user-agent", USER_AGENT);
+    for (const [name, value] of Object.entries(BROWSER_CLIENT_HINT_HEADERS)) {
+      if (!headers.has(name)) {
+        headers.set(name, value);
+      }
+    }
     if (!headers.has("accept")) {
       headers.set("accept", "*/*");
     }
@@ -305,18 +359,48 @@ export class VeniceWebClient {
   }
 
   async bootstrap() {
+    await this.request(`${VENICE_ORIGIN}/sign-in`, {
+      headers: {
+        accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        referer: `${VENICE_ORIGIN}/`,
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "same-origin",
+      },
+    });
+
     await this.request(`${VENICE_ORIGIN}/api/auth/session`, {
       headers: {
+        ...BROWSER_CORS_HEADERS,
         "content-type": "application/json",
+        referer: `${VENICE_ORIGIN}/sign-in`,
+        "sec-fetch-site": "same-origin",
       },
     });
 
     await this.request(
       `${CLERK_BASE_URL}/v1/environment?__clerk_api_version=${CLERK_API_VERSION}&_clerk_js_version=${CLERK_JS_VERSION}`,
+      {
+        headers: {
+          ...BROWSER_CORS_HEADERS,
+          origin: VENICE_ORIGIN,
+          referer: `${VENICE_ORIGIN}/`,
+          "sec-fetch-site": "same-site",
+        },
+      },
     );
 
     await this.request(
       `${CLERK_BASE_URL}/v1/client?__clerk_api_version=${CLERK_API_VERSION}&_clerk_js_version=${CLERK_JS_VERSION}`,
+      {
+        headers: {
+          ...BROWSER_CORS_HEADERS,
+          origin: VENICE_ORIGIN,
+          referer: `${VENICE_ORIGIN}/`,
+          "sec-fetch-site": "same-site",
+        },
+      },
     );
   }
 
@@ -325,8 +409,10 @@ export class VeniceWebClient {
       `${CLERK_BASE_URL}/v1/client?__clerk_api_version=${CLERK_API_VERSION}&_clerk_js_version=${CLERK_JS_VERSION}`,
       {
         headers: {
+          ...BROWSER_CORS_HEADERS,
           origin: VENICE_ORIGIN,
           referer: `${VENICE_ORIGIN}/`,
+          "sec-fetch-site": "same-site",
         },
       },
     );
@@ -339,9 +425,11 @@ export class VeniceWebClient {
       {
         method: "POST",
         headers: {
+          ...BROWSER_CORS_HEADERS,
           "content-type": "application/x-www-form-urlencoded",
           origin: VENICE_ORIGIN,
           referer: `${VENICE_ORIGIN}/`,
+          "sec-fetch-site": "same-site",
         },
         body: toUrlEncoded({
           locale: "en-US",
@@ -359,9 +447,11 @@ export class VeniceWebClient {
       {
         method: "POST",
         headers: {
+          ...BROWSER_CORS_HEADERS,
           "content-type": "application/x-www-form-urlencoded",
           origin: VENICE_ORIGIN,
           referer: `${VENICE_ORIGIN}/`,
+          "sec-fetch-site": "same-site",
         },
         body: toUrlEncoded({
           strategy: "password",
@@ -377,27 +467,32 @@ export class VeniceWebClient {
     await this.request(`${VENICE_ORIGIN}/sign-in/continue`, {
       method: "POST",
       headers: {
+        ...BROWSER_CORS_HEADERS,
+        accept: "text/x-component",
         "content-type": "text/plain;charset=UTF-8",
         origin: VENICE_ORIGIN,
-        referer: `${VENICE_ORIGIN}/`,
+        referer: `${VENICE_ORIGIN}/sign-in/continue`,
+        "sec-fetch-site": "same-origin",
       },
       body: "[]",
     });
   }
 
-  async touchSession(sessionId) {
+  async touchSession(sessionId, intent = "select_session") {
     const response = await this.request(
       `${CLERK_BASE_URL}/v1/client/sessions/${encodeURIComponent(sessionId)}/touch?__clerk_api_version=${CLERK_API_VERSION}&_clerk_js_version=${CLERK_JS_VERSION}`,
       {
         method: "POST",
         headers: {
+          ...BROWSER_CORS_HEADERS,
           "content-type": "application/x-www-form-urlencoded",
           origin: VENICE_ORIGIN,
           referer: `${VENICE_ORIGIN}/`,
+          "sec-fetch-site": "same-site",
         },
         body: toUrlEncoded({
           active_organization_id: "",
-          intent: "focus",
+          intent,
         }),
       },
     );
@@ -619,6 +714,13 @@ export class VeniceWebClient {
   }
 
   async login() {
+    if (!this.email) {
+      this.email = requiredCredential("VENICE_EMAIL");
+    }
+    if (!this.password) {
+      this.password = requiredCredential("VENICE_PASSWORD");
+    }
+
     await this.bootstrap();
 
     const signIn = await this.startSignIn();
@@ -642,10 +744,13 @@ export class VeniceWebClient {
     this.sessionId = sessionId;
 
     await this.continueAfterSignIn();
-    await this.touchSession(sessionId);
-
-    const tokenResponse = await this.mintSessionToken(sessionId);
-    const jwt = tokenResponse?.jwt;
+    const touched = await this.touchSession(sessionId);
+    let jwt = touched?.response?.last_active_token?.jwt;
+    let tokenResponse = null;
+    if (!jwt) {
+      tokenResponse = await this.mintSessionToken(sessionId);
+      jwt = tokenResponse?.jwt;
+    }
     if (!jwt) {
       throw new Error(`Could not mint Clerk session JWT: ${JSON.stringify(tokenResponse)}`);
     }
@@ -676,8 +781,12 @@ export class VeniceWebClient {
     const payload = decodeJwtPayload(jwt);
     const expiresAt = typeof payload?.exp === "number" ? payload.exp * 1000 : null;
     if (!jwt || !expiresAt || expiresAt <= nowMs() + 30_000) {
-      const tokenResponse = await this.mintSessionToken(restored.sessionId);
-      jwt = tokenResponse?.jwt ?? null;
+      const touched = await this.touchSession(restored.sessionId);
+      jwt = touched?.response?.last_active_token?.jwt ?? null;
+      if (!jwt) {
+        const tokenResponse = await this.mintSessionToken(restored.sessionId);
+        jwt = tokenResponse?.jwt ?? null;
+      }
     }
 
     if (!jwt) {

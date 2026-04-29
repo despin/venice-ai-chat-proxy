@@ -28,7 +28,7 @@ docker run --rm -p 3456:3456 `
 At container startup it will:
 
 - try to restore the saved session from `/data/.venice-web-session.json`
-- fall back to a full Venice login with `VENICE_EMAIL` and `VENICE_PASSWORD` if needed
+- fall back to a full browserless Venice login with `VENICE_EMAIL` and `VENICE_PASSWORD` if needed
 - keep the proxy running after auth completes
 
 Point Open WebUI at:
@@ -54,7 +54,7 @@ services:
     restart: unless-stopped
 ```
 
-There is also a ready-to-use example file at [docker-compose.example.yml](/D:/code/venice-ai-proxy/docker-compose.example.yml).
+There is also a ready-to-use example file at `docker-compose.example.yml`.
 
 If Open WebUI is also in Docker Compose, use:
 
@@ -62,7 +62,7 @@ If Open WebUI is also in Docker Compose, use:
 
 **Notes**
 
-- The proxy does not perform interactive login on request. The session file must already exist.
+- The proxy does not perform interactive login on request. Startup restores the session file or creates it with the browserless login flow.
 - The proxy still does not log in during incoming requests. Login or restore happens once at container startup.
 - Clerk JWTs are short-lived; the persisted cookies inside the session file are what allow restore.
 - If the session fully expires, the container startup path will log in again as long as `VENICE_EMAIL` and `VENICE_PASSWORD` are set.

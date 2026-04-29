@@ -1,1 +1,5 @@
 *.har
+venice-login.json
+.venice-web-session.json
+.venice-login-venv/
+__pycache__/
