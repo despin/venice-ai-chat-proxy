@@ -604,7 +604,7 @@ async function main() {
   console.log(`Venice OpenAI proxy listening on http://${host}:${port}`);
 }
 
-if (import.meta.url === `file:///${process.argv[1]?.replace(/\\/g, "/")}`) {
+if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}`) {
   main().catch((error) => {
     console.error(error);
     process.exitCode = 1;

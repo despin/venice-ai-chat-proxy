@@ -176,7 +176,7 @@ function main() {
   console.log(`Model: ${DEFAULT_MODEL}`);
 }
 
-if (import.meta.url === `file:///${process.argv[1]?.replace(/\\/g, "/")}`) {
+if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}`) {
   try {
     main();
   } catch (error) {
