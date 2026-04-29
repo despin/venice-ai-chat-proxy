@@ -1,0 +1,20 @@
+services:
+  venice-openai-proxy:
+    build: .
+    container_name: venice-openai-proxy
+    ports:
+      - "3456:3456"
+    environment:
+      VENICE_EMAIL: "example@example.com" 
+      VENICE_PASSWORD: "your_private_password"
+      VENICE_SESSION_FILE: /data/.venice-web-session.json
+    volumes:
+      - /path/to/session:/data
+    restart: unless-stopped
+    networks:
+      - ai-shared
+
+networks:
+  ai-shared:
+    # Use this to connect to OpenWebUI or other services in the same network
+    name: ai-shared 
