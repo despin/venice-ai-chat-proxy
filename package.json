@@ -1,0 +1,17 @@
+{
+  "scripts": {
+    "check:models": "node ./check-proxy-models.mjs",
+    "clean-session": "node ./venice-login.mjs --clean-session",
+    "convert:chat": "node ./convert-venice-chat.mjs",
+    "login": "node ./venice-login.mjs",
+    "login:direct": "node ./venice-login.mjs --direct",
+    "login:restore": "node ./venice-login.mjs --restore",
+    "login:restore-only": "node ./venice-login.mjs --restore-only",
+    "poc": "node ./venice-web-poc.mjs",
+    "proxy": "node ./venice-openai-proxy.mjs",
+    "start": "node ./venice-start.mjs"
+  },
+  "dependencies": {
+    "wreq-js": "^2.3.0"
+  }
+}

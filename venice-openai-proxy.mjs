@@ -78,7 +78,9 @@ function logOutgoingResponse({
   streamDurationMs = null,
 }) {
   const streamPart =
-    typeof streamDurationMs === "number" ? ` stream_ms=${streamDurationMs}` : "";
+    typeof streamDurationMs === "number"
+      ? ` stream_ms=${streamDurationMs}`
+      : "";
   const modelPart = model ? ` model=${model}` : "";
   console.log(
     `[${nowIso()}] outgoing ${req.method} ${url.pathname} status=${status}${modelPart} content_chars=${contentLength} reasoning_chars=${reasoningLength} duration_ms=${durationMs}${streamPart}`,
@@ -175,7 +177,12 @@ function splitMessages(messages) {
   };
 }
 
-function buildChatCompletionResponse({ requestModel, completionId, text, created }) {
+function buildChatCompletionResponse({
+  requestModel,
+  completionId,
+  text,
+  created,
+}) {
   return {
     id: completionId || `chatcmpl_${created}`,
     object: "chat.completion",
@@ -252,7 +259,9 @@ class VeniceOpenAiProxy {
         this.client.restoreSavedSession(saved);
         if (this.client.hasUsableSavedJwt(saved)) {
           try {
-            const userSession = await this.client.getUserSession(saved.clerkJwt);
+            const userSession = await this.client.getUserSession(
+              saved.clerkJwt,
+            );
             this.client.writeSavedSession({ lastValidatedAt: Date.now() });
             return {
               source: "session",
@@ -270,7 +279,9 @@ class VeniceOpenAiProxy {
 
         try {
           const restored = await this.client.restoreSessionFromCookies();
-          const userSession = await this.client.getUserSession(restored.clerkJwt);
+          const userSession = await this.client.getUserSession(
+            restored.clerkJwt,
+          );
           this.client.writeSavedSession({
             lastValidatedAt: Date.now(),
             restoredAt: Date.now(),
@@ -294,14 +305,21 @@ class VeniceOpenAiProxy {
     return await this.authPromise;
   }
 
-  async getModels() {
+  async getModels(options = {}) {
+    const { onlyFree = false } = options || {};
     const auth = await this.ensureAuth();
     const models = await this.client.getTextModels(auth.login.clerkJwt, {
       matureFilter: false,
       onlySafeVenice: false,
     });
     return models
-      .filter((model) => model && model.active !== false && model.type === "text")
+      .filter(
+        (model) =>
+          model &&
+          model.active !== false &&
+          model.type === "text" &&
+          (!onlyFree || model.usesCredits === false),
+      )
       .map((model) => ({
         id: model.apiModelId || model.id,
         object: "model",
@@ -356,11 +374,16 @@ export function createVeniceOpenAiProxy() {
   return new VeniceOpenAiProxy();
 }
 
-export function createVeniceOpenAiProxyServer(proxy = createVeniceOpenAiProxy()) {
+export function createVeniceOpenAiProxyServer(
+  proxy = createVeniceOpenAiProxy(),
+) {
   return http.createServer(async (req, res) => {
     const startedAt = Date.now();
     try {
-      const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+      const url = new URL(
+        req.url || "/",
+        `http://${req.headers.host || "localhost"}`,
+      );
 
       if (req.method === "OPTIONS") {
         logIncomingRequest(req, url, 0);
@@ -375,7 +398,10 @@ export function createVeniceOpenAiProxyServer(proxy = createVeniceOpenAiProxy())
         return;
       }
 
-      if (req.method === "GET" && (url.pathname === "/models" || url.pathname === "/v1/models")) {
+      if (
+        req.method === "GET" &&
+        (url.pathname === "/models" || url.pathname === "/v1/models")
+      ) {
         logIncomingRequest(req, url, 0);
         const data = await proxy.getModels();
         json(res, 200, { object: "list", data });
@@ -390,14 +416,18 @@ export function createVeniceOpenAiProxyServer(proxy = createVeniceOpenAiProxy())
 
       if (
         req.method === "POST" &&
-        (url.pathname === "/chat/completions" || url.pathname === "/v1/chat/completions")
+        (url.pathname === "/chat/completions" ||
+          url.pathname === "/v1/chat/completions")
       ) {
         const bodyText = await readBody(req);
         logIncomingRequest(req, url, getRequestLength(req, bodyText));
         const payload = safeJsonParse(bodyText);
         if (!payload || typeof payload !== "object") {
           json(res, 400, {
-            error: { message: "Invalid JSON body", type: "invalid_request_error" },
+            error: {
+              message: "Invalid JSON body",
+              type: "invalid_request_error",
+            },
           });
           logOutgoingResponse({
             req,
@@ -409,7 +439,10 @@ export function createVeniceOpenAiProxyServer(proxy = createVeniceOpenAiProxy())
         }
         if (!Array.isArray(payload.messages) || payload.messages.length === 0) {
           json(res, 400, {
-            error: { message: "`messages` is required", type: "invalid_request_error" },
+            error: {
+              message: "`messages` is required",
+              type: "invalid_request_error",
+            },
           });
           logOutgoingResponse({
             req,
@@ -440,10 +473,16 @@ export function createVeniceOpenAiProxyServer(proxy = createVeniceOpenAiProxy())
             for await (const event of stream.events) {
               updateStreamStats(stats, event);
 
-              if (event?.kind === "meta" && typeof event.completion_id === "string") {
+              if (
+                event?.kind === "meta" &&
+                typeof event.completion_id === "string"
+              ) {
                 completionId = event.completion_id;
               }
-              if (event?.kind === "meta" && typeof event.servingModelId === "string") {
+              if (
+                event?.kind === "meta" &&
+                typeof event.servingModelId === "string"
+              ) {
                 servingModelId = event.servingModelId;
               }
 
@@ -453,7 +492,13 @@ export function createVeniceOpenAiProxyServer(proxy = createVeniceOpenAiProxy())
                   object: "chat.completion.chunk",
                   created,
                   model: servingModelId,
-                  choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { role: "assistant" },
+                      finish_reason: null,
+                    },
+                  ],
                 });
                 roleChunkSent = true;
               }
@@ -467,7 +512,13 @@ export function createVeniceOpenAiProxyServer(proxy = createVeniceOpenAiProxy())
                 object: "chat.completion.chunk",
                 created,
                 model: servingModelId,
-                choices: [{ index: 0, delta: { content: event.content }, finish_reason: null }],
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: event.content },
+                    finish_reason: null,
+                  },
+                ],
               });
             }
 
@@ -477,7 +528,13 @@ export function createVeniceOpenAiProxyServer(proxy = createVeniceOpenAiProxy())
                 object: "chat.completion.chunk",
                 created,
                 model: servingModelId,
-                choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+                choices: [
+                  {
+                    index: 0,
+                    delta: { role: "assistant" },
+                    finish_reason: null,
+                  },
+                ],
               });
             }
 
@@ -523,11 +580,13 @@ export function createVeniceOpenAiProxyServer(proxy = createVeniceOpenAiProxy())
         const result = await proxy.chatCompletions(payload);
         const created = Math.floor(Date.now() / 1000);
         const completionId =
-          result.events.find((event) => event?.kind === "meta" && event?.completion_id)
-            ?.completion_id || `chatcmpl_${created}`;
+          result.events.find(
+            (event) => event?.kind === "meta" && event?.completion_id,
+          )?.completion_id || `chatcmpl_${created}`;
         const servingModelId =
-          result.events.find((event) => event?.kind === "meta" && event?.servingModelId)
-            ?.servingModelId || payload.model;
+          result.events.find(
+            (event) => event?.kind === "meta" && event?.servingModelId,
+          )?.servingModelId || payload.model;
         const lengths = collectStreamLengths(result.events);
 
         json(
@@ -553,7 +612,9 @@ export function createVeniceOpenAiProxyServer(proxy = createVeniceOpenAiProxy())
       }
 
       logIncomingRequest(req, url, 0);
-      json(res, 404, { error: { message: "Not found", type: "invalid_request_error" } });
+      json(res, 404, {
+        error: { message: "Not found", type: "invalid_request_error" },
+      });
       logOutgoingResponse({
         req,
         url,
@@ -561,7 +622,10 @@ export function createVeniceOpenAiProxyServer(proxy = createVeniceOpenAiProxy())
         durationMs: Date.now() - startedAt,
       });
     } catch (error) {
-      const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+      const url = new URL(
+        req.url || "/",
+        `http://${req.headers.host || "localhost"}`,
+      );
       if (res.headersSent) {
         if (!res.writableEnded) {
           res.end();

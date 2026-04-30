@@ -1,16 +1,11 @@
 import readline from "node:readline";
-import { access, mkdir, readFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import path from "node:path";
+import { readFile, rm } from "node:fs/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { VeniceWebClient } from "./venice-web-poc.mjs";
 
 const CREDENTIALS_FILE = new URL("./venice-login.json", import.meta.url);
-const CURL_CFFI_LOGIN = new URL("./venice-login-curl-cffi.py", import.meta.url);
-const LOCAL_VENV_DIR = new URL("./.venice-login-venv/", import.meta.url);
-const LOCAL_VENV_PYTHON =
-  process.platform === "win32"
-    ? new URL("Scripts/python.exe", LOCAL_VENV_DIR)
-    : new URL("bin/python", LOCAL_VENV_DIR);
+const DEFAULT_SESSION_FILE = ".venice-web-session.json";
 
 async function readCredentialsFile() {
   try {
@@ -58,81 +53,9 @@ function askHidden(question) {
   });
 }
 
-function runProcess(command, args, env) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) {
-        resolve(stdout);
-        return;
-      }
-      reject(new Error(stderr.trim() || `${command} exited with code ${code}`));
-    });
-  });
-}
-
-async function processSucceeds(command, args, env = process.env) {
-  try {
-    await runProcess(command, args, env);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function ensureCurlCffiPython() {
-  const configured = process.env.VENICE_PYTHON?.trim() || process.env.PYTHON?.trim();
-  const candidates = [
-    configured,
-    LOCAL_VENV_PYTHON.pathname,
-    "python3",
-    "python",
-  ].filter(Boolean);
-
-  for (const python of candidates) {
-    if (await processSucceeds(python, ["-c", "import curl_cffi"])) {
-      return python;
-    }
-  }
-
-  const bootstrapPython = configured || "python3";
-  await mkdir(LOCAL_VENV_DIR, { recursive: true });
-  await runProcess(bootstrapPython, ["-m", "venv", LOCAL_VENV_DIR.pathname], process.env);
-  const venvPython = LOCAL_VENV_PYTHON.pathname;
-  await access(venvPython);
-  await runProcess(
-    venvPython,
-    ["-m", "pip", "install", "--upgrade", "pip", "curl_cffi"],
-    process.env,
-  );
-  return venvPython;
-}
-
-async function loginWithCurlCffi({ email, password, sessionFile }) {
-  const python = await ensureCurlCffiPython();
-  const stdout = await runProcess(
-    python,
-    [CURL_CFFI_LOGIN.pathname],
-    {
-      ...process.env,
-      VENICE_EMAIL: email,
-      VENICE_PASSWORD: password,
-      ...(sessionFile ? { VENICE_SESSION_FILE: sessionFile } : {}),
-    },
-  );
-  return JSON.parse(stdout);
+async function loginWithWreq(options) {
+  const { loginWithWreq: login } = await import("./venice-login-wreq.mjs");
+  return login(options);
 }
 
 async function loginDirect(client) {
@@ -203,11 +126,52 @@ async function restoreWithDirectFallback(client) {
   };
 }
 
+function resolveSessionFile(sessionFile) {
+  return path.resolve(process.cwd(), sessionFile);
+}
+
+async function cleanSessionData(credentials) {
+  const sessionFiles = new Set(
+    [
+      process.env.VENICE_SESSION_FILE?.trim(),
+      credentials.sessionFile,
+      DEFAULT_SESSION_FILE,
+    ]
+      .filter(Boolean)
+      .map(resolveSessionFile),
+  );
+
+  const results = [];
+  for (const sessionFile of sessionFiles) {
+    try {
+      await rm(sessionFile, { force: true });
+      results.push({ sessionFile, removed: true });
+    } catch (error) {
+      results.push({ sessionFile, removed: false, error: error.message });
+    }
+  }
+
+  return {
+    ok: results.every((result) => result.removed),
+    command: "clean-session",
+    credentialsFile: CREDENTIALS_FILE.pathname,
+    credentialsFileRemoved: false,
+    results,
+  };
+}
+
 async function main() {
+  const cleanSessionFlag = process.argv.includes("--clean-session");
   const restoreFlag = process.argv.includes("--restore");
   const restoreOnlyFlag = process.argv.includes("--restore-only");
   const directOnly = process.argv.includes("--direct");
   const credentials = await readCredentialsFile();
+
+  if (cleanSessionFlag) {
+    console.log(JSON.stringify(await cleanSessionData(credentials), null, 2));
+    return;
+  }
+
   const email = process.env.VENICE_EMAIL?.trim() || credentials.email || await ask("Venice email: ");
   const password = process.env.VENICE_PASSWORD || credentials.password || await askHidden("Venice password: ");
   const sessionFile = process.env.VENICE_SESSION_FILE?.trim() || credentials.sessionFile;
@@ -231,7 +195,7 @@ async function main() {
       ? await restoreWithDirectFallback(client)
       : directOnly
         ? await loginDirect(client)
-        : await loginWithCurlCffi({ email, password, sessionFile: client.sessionFile });
+        : await loginWithWreq({ email, password, sessionFile: client.sessionFile });
 
   console.log(JSON.stringify(result, null, 2));
 }

@@ -28,7 +28,7 @@ docker run --rm -p 3456:3456 `
 At container startup it will:
 
 - try to restore the saved session from `/data/.venice-web-session.json`
-- fall back to a full browserless Venice login with `VENICE_EMAIL` and `VENICE_PASSWORD` if needed
+- fall back to a full browserless Venice login with npm `wreq-js`, `VENICE_EMAIL`, and `VENICE_PASSWORD` if needed
 - keep the proxy running after auth completes
 
 Point Open WebUI at:
