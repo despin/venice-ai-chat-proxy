@@ -3,6 +3,9 @@ import { VeniceWebClient } from "./venice-web-poc.mjs";
 
 const PORT = Number(process.env.PORT || process.env.VENICE_PROXY_PORT || 3456);
 const HOST = process.env.HOST || "0.0.0.0";
+const CORS_ALLOW_METHODS = "GET,POST,OPTIONS";
+const CORS_DEFAULT_ALLOW_HEADERS =
+  "authorization,content-type,accept,origin,user-agent,x-requested-with";
 
 function nowIso() {
   return new Date().toISOString();
@@ -92,17 +95,29 @@ function json(res, status, body) {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "content-length": Buffer.byteLength(text),
-    ...corsHeaders(),
   });
   res.end(text);
 }
 
-function corsHeaders() {
+function corsHeaders(req) {
+  const requestedHeaders = req?.headers["access-control-request-headers"];
   return {
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "authorization,content-type",
+    "access-control-allow-methods": CORS_ALLOW_METHODS,
+    "access-control-allow-headers":
+      typeof requestedHeaders === "string" && requestedHeaders.trim()
+        ? requestedHeaders
+        : CORS_DEFAULT_ALLOW_HEADERS,
+    "access-control-max-age": "86400",
+    "access-control-expose-headers": "content-type",
+    vary: "access-control-request-headers",
   };
+}
+
+function applyCorsHeaders(req, res) {
+  for (const [name, value] of Object.entries(corsHeaders(req))) {
+    res.setHeader(name, value);
+  }
 }
 
 function readBody(req) {
@@ -379,6 +394,7 @@ export function createVeniceOpenAiProxyServer(
 ) {
   return http.createServer(async (req, res) => {
     const startedAt = Date.now();
+    applyCorsHeaders(req, res);
     try {
       const url = new URL(
         req.url || "/",
@@ -387,7 +403,7 @@ export function createVeniceOpenAiProxyServer(
 
       if (req.method === "OPTIONS") {
         logIncomingRequest(req, url, 0);
-        res.writeHead(204, corsHeaders());
+        res.writeHead(204);
         res.end();
         logOutgoingResponse({
           req,
@@ -466,7 +482,6 @@ export function createVeniceOpenAiProxyServer(
             "content-type": "text/event-stream; charset=utf-8",
             "cache-control": "no-cache",
             connection: "keep-alive",
-            ...corsHeaders(),
           });
 
           try {
