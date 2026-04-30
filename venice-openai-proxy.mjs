@@ -403,7 +403,7 @@ export function createVeniceOpenAiProxyServer(
         (url.pathname === "/models" || url.pathname === "/v1/models")
       ) {
         logIncomingRequest(req, url, 0);
-        const data = await proxy.getModels();
+        const data = await proxy.getModels({ onlyFree: true });
         json(res, 200, { object: "list", data });
         logOutgoingResponse({
           req,
