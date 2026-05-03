@@ -6,6 +6,12 @@ const HOST = process.env.HOST || "0.0.0.0";
 const CORS_ALLOW_METHODS = "GET,POST,OPTIONS";
 const CORS_DEFAULT_ALLOW_HEADERS =
   "authorization,content-type,accept,origin,user-agent,x-requested-with";
+const MODEL_OVERLOADED_MAX_RETRIES = Number(
+  process.env.VENICE_MODEL_OVERLOADED_MAX_RETRIES || 2,
+);
+const MODEL_OVERLOADED_RETRY_DELAY_MS = Number(
+  process.env.VENICE_MODEL_OVERLOADED_RETRY_DELAY_MS || 750,
+);
 
 function nowIso() {
   return new Date().toISOString();
@@ -134,6 +140,47 @@ function safeJsonParse(text) {
     return JSON.parse(text);
   } catch {
     return null;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isModelOverloadedError(error) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return (
+    error.message.startsWith("HTTP 429:") &&
+    error.message.includes('"error":"modelOverloaded"')
+  );
+}
+
+async function retryModelOverloaded(operation, { label, model }) {
+  const maxRetries = Number.isFinite(MODEL_OVERLOADED_MAX_RETRIES)
+    ? Math.max(0, MODEL_OVERLOADED_MAX_RETRIES)
+    : 0;
+  const baseDelayMs = Number.isFinite(MODEL_OVERLOADED_RETRY_DELAY_MS)
+    ? Math.max(0, MODEL_OVERLOADED_RETRY_DELAY_MS)
+    : 0;
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await operation(attempt);
+    } catch (error) {
+      if (!isModelOverloadedError(error) || attempt >= maxRetries) {
+        throw error;
+      }
+
+      const delayMs = baseDelayMs * (attempt + 1);
+      console.warn(
+        `[${nowIso()}] upstream model overloaded; retrying ${label} model=${model} attempt=${attempt + 1}/${maxRetries} delay_ms=${delayMs}`,
+      );
+      if (delayMs > 0) {
+        await sleep(delayMs);
+      }
+    }
   }
 }
 
@@ -358,14 +405,19 @@ class VeniceOpenAiProxy {
       throw new Error("No usable prompt messages found.");
     }
 
-    const requestId = Math.random().toString(36).slice(2, 9);
-    const result = await this.client.chat(auth.login.clerkJwt, undefined, {
-      model: payload.model || this.client.model,
-      promptMessages: prompt,
-      systemPrompt,
-      requestId,
-    });
-    return result;
+    const model = payload.model || this.client.model;
+    return await retryModelOverloaded(
+      async () => {
+        const requestId = Math.random().toString(36).slice(2, 9);
+        return await this.client.chat(auth.login.clerkJwt, undefined, {
+          model,
+          promptMessages: prompt,
+          systemPrompt,
+          requestId,
+        });
+      },
+      { label: "chat completion", model },
+    );
   }
 
   async openChatCompletionStream(payload) {
@@ -375,13 +427,19 @@ class VeniceOpenAiProxy {
       throw new Error("No usable prompt messages found.");
     }
 
-    const requestId = Math.random().toString(36).slice(2, 9);
-    return await this.client.openChatStream(auth.login.clerkJwt, undefined, {
-      model: payload.model || this.client.model,
-      promptMessages: prompt,
-      systemPrompt,
-      requestId,
-    });
+    const model = payload.model || this.client.model;
+    return await retryModelOverloaded(
+      async () => {
+        const requestId = Math.random().toString(36).slice(2, 9);
+        return await this.client.openChatStream(auth.login.clerkJwt, undefined, {
+          model,
+          promptMessages: prompt,
+          systemPrompt,
+          requestId,
+        });
+      },
+      { label: "chat completion stream", model },
+    );
   }
 }
 
