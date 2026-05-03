@@ -1,5 +1,6 @@
 {
   "scripts": {
+    "check:concurrency": "node ./check-proxy-concurrency.mjs",
     "check:models": "node ./check-proxy-models.mjs",
     "clean-session": "node ./venice-login.mjs --clean-session",
     "convert:chat": "node ./convert-venice-chat.mjs",
