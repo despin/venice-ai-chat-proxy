@@ -414,6 +414,7 @@ class VeniceOpenAiProxy {
           promptMessages: prompt,
           systemPrompt,
           requestId,
+          reasoning: true,
         });
       },
       { label: "chat completion", model },
@@ -436,6 +437,7 @@ class VeniceOpenAiProxy {
           promptMessages: prompt,
           systemPrompt,
           requestId,
+          reasoning: true,
         });
       },
       { label: "chat completion stream", model },
