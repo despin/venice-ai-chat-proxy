@@ -534,7 +534,7 @@ export function createVeniceOpenAiProxyServer(
           const created = Math.floor(Date.now() / 1000);
           let completionId = `chatcmpl_${created}`;
           let servingModelId = payload.model || proxy.client.model;
-          let roleChunkSent = false;
+          let firstDeltaSent = false;
           const stats = createStreamStats();
           const stream = await proxy.openChatCompletionStream(payload);
 
@@ -561,64 +561,89 @@ export function createVeniceOpenAiProxyServer(
                 servingModelId = event.servingModelId;
               }
 
-              if (!roleChunkSent) {
-                writeSseChunk(res, {
-                  id: completionId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: servingModelId,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: { role: "assistant" },
-                      finish_reason: null,
-                    },
-                  ],
-                });
-                roleChunkSent = true;
-              }
-
-              if (event?.kind !== "content" || !event.content) {
+              if (event?.kind !== "content") {
                 continue;
               }
 
+              const contentVal =
+                typeof event.content === "string" && event.content !== ""
+                  ? event.content
+                  : null;
+              const reasoningVal =
+                typeof event.reasoning_content === "string" &&
+                event.reasoning_content !== ""
+                  ? event.reasoning_content
+                  : null;
+
+              if (contentVal === null && reasoningVal === null) {
+                continue;
+              }
+
+              const delta = firstDeltaSent
+                ? { content: contentVal, reasoning_content: reasoningVal }
+                : {
+                    content: contentVal,
+                    reasoning_content: reasoningVal,
+                    role: "assistant",
+                  };
+              firstDeltaSent = true;
+
               writeSseChunk(res, {
-                id: completionId,
+                choices: [
+                  { delta, finish_reason: null, index: 0, logprobs: null },
+                ],
                 object: "chat.completion.chunk",
+                usage: null,
                 created,
                 model: servingModelId,
-                choices: [
-                  {
-                    index: 0,
-                    delta: { content: event.content },
-                    finish_reason: null,
-                  },
-                ],
+                id: completionId,
               });
             }
 
-            if (!roleChunkSent) {
+            if (!firstDeltaSent) {
               writeSseChunk(res, {
-                id: completionId,
-                object: "chat.completion.chunk",
-                created,
-                model: servingModelId,
                 choices: [
                   {
-                    index: 0,
-                    delta: { role: "assistant" },
+                    delta: {
+                      content: null,
+                      reasoning_content: null,
+                      role: "assistant",
+                    },
                     finish_reason: null,
+                    index: 0,
+                    logprobs: null,
                   },
                 ],
+                object: "chat.completion.chunk",
+                usage: null,
+                created,
+                model: servingModelId,
+                id: completionId,
               });
             }
 
             writeSseChunk(res, {
-              id: completionId,
+              choices: [
+                {
+                  finish_reason: "stop",
+                  delta: { content: "", reasoning_content: null },
+                  index: 0,
+                  logprobs: null,
+                },
+              ],
               object: "chat.completion.chunk",
+              usage: null,
               created,
               model: servingModelId,
-              choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+              id: completionId,
+            });
+            writeSseChunk(res, {
+              choices: [],
+              object: "chat.completion.chunk",
+              usage: null,
+              created,
+              model: servingModelId,
+              id: completionId,
             });
             res.write("data: [DONE]\n\n");
             res.end();
