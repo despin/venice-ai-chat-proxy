@@ -1,5 +1,6 @@
 import readline from "node:readline";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { readFile, rm } from "node:fs/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { VeniceWebClient } from "./venice-web-poc.mjs";
@@ -200,7 +201,7 @@ async function main() {
   console.log(JSON.stringify(result, null, 2));
 }
 
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
     console.error(error);
     process.exitCode = 1;

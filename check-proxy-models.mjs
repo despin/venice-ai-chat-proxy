@@ -1,3 +1,4 @@
+import { pathToFileURL } from "node:url";
 import { startVeniceOpenAiProxyServer } from "./venice-openai-proxy.mjs";
 
 const REPEATS = Number(process.env.CHECK_PROXY_MODELS_REPEATS || 3);
@@ -59,7 +60,7 @@ async function main() {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
     console.error(error);
     process.exitCode = 1;

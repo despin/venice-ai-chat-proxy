@@ -1,3 +1,4 @@
+import { pathToFileURL } from "node:url";
 import { startVeniceOpenAiProxyServer } from "./venice-openai-proxy.mjs";
 
 const DEFAULT_PROMPTS = [
@@ -332,7 +333,7 @@ async function main() {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
     console.error(error);
     process.exitCode = 1;

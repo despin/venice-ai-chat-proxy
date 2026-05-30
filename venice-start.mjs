@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { VeniceWebClient } from "./venice-web-poc.mjs";
 import { startVeniceOpenAiProxyServer } from "./venice-openai-proxy.mjs";
 
@@ -57,7 +58,7 @@ async function main() {
   console.log(`Venice OpenAI proxy listening on http://${host}:${port}`);
 }
 
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;

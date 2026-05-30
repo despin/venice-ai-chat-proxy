@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_MODEL = process.env.VENICE_IMPORT_MODEL?.trim() || "venice-web";
 const DEFAULT_DATE_ORDER = (process.env.VENICE_DATE_ORDER?.trim() || "DMY").toUpperCase();
@@ -176,7 +177,7 @@ function main() {
   console.log(`Model: ${DEFAULT_MODEL}`);
 }
 
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     main();
   } catch (error) {
