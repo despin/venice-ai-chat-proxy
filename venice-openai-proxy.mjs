@@ -1,6 +1,7 @@
 import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { VeniceWebClient } from "./venice-web-poc.mjs";
+import { AgenticProxy } from "./venice-agentic-proxy.mjs";
 
 const PORT = Number(process.env.PORT || process.env.VENICE_PROXY_PORT || 3456);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -13,6 +14,20 @@ const MODEL_OVERLOADED_MAX_RETRIES = Number(
 const MODEL_OVERLOADED_RETRY_DELAY_MS = Number(
   process.env.VENICE_MODEL_OVERLOADED_RETRY_DELAY_MS || 750,
 );
+const DEBUG = Boolean(process.env.VENICE_DEBUG?.trim());
+const AGENTIC_MODEL_NAME = process.env.VENICE_AGENTIC_MODEL_NAME?.trim() || "agentic";
+
+function debugLog(label, data) {
+  if (!DEBUG) return;
+  const prefix = `[debug:${label}]`;
+  if (data === undefined) {
+    process.stderr.write(`${prefix}\n`);
+  } else if (typeof data === "string") {
+    process.stderr.write(`${prefix} ${data}\n`);
+  } else {
+    process.stderr.write(`${prefix} ${JSON.stringify(data)}\n`);
+  }
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -302,6 +317,7 @@ function updateStreamStats(stats, event) {
 class VeniceOpenAiProxy {
   constructor() {
     this.client = new VeniceWebClient();
+    this.agentic = new AgenticProxy(this.client);
     this.authPromise = null;
   }
 
@@ -493,6 +509,119 @@ export function createVeniceOpenAiProxyServer(
 
       if (
         req.method === "POST" &&
+        (url.pathname === "/responses" || url.pathname === "/v1/responses")
+      ) {
+        const bodyText = await readBody(req);
+        logIncomingRequest(req, url, getRequestLength(req, bodyText));
+        const payload = safeJsonParse(bodyText);
+        if (!payload || typeof payload !== "object") {
+          json(res, 400, { error: { message: "Invalid JSON body", type: "invalid_request_error" } });
+          logOutgoingResponse({ req, url, status: 400, durationMs: Date.now() - startedAt });
+          return;
+        }
+        if (!payload.input || (typeof payload.input !== "string" && !Array.isArray(payload.input))) {
+          json(res, 400, { error: { message: "`input` is required (string or array)", type: "invalid_request_error" } });
+          logOutgoingResponse({ req, url, status: 400, durationMs: Date.now() - startedAt });
+          return;
+        }
+
+        const auth = await proxy.ensureAuth();
+        const agentModelId = proxy.agentic.agentModelId();
+        const stream = await proxy.agentic.openStream(auth.login.clerkJwt, payload.input);
+        const created = Math.floor(Date.now() / 1000);
+        let responseId = `resp_${created}`;
+        let contentLength = 0;
+
+        if (payload.stream) {
+          res.writeHead(200, {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache",
+            connection: "keep-alive",
+          });
+
+          try {
+            for await (const sseEvent of stream.events) {
+              const { event, data } = sseEvent;
+              debugLog("workflow:event", sseEvent);
+
+              if (event === "response.created" || event === "response.in_progress") {
+                if (data?.response?.id) responseId = data.response.id;
+                debugLog("responses:forward", event);
+                res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+                continue;
+              }
+
+              if (event === "response.output_text.delta") {
+                contentLength += getTextLength(data?.delta);
+                debugLog("responses:forward", event);
+                res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+                continue;
+              }
+
+              if (
+                event === "response.completed" ||
+                event === "response.output_item.done" ||
+                event === "response.content_part.done" ||
+                event === "response.output_item.added" ||
+                event === "response.content_part.added"
+              ) {
+                debugLog("responses:forward", event);
+                res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+                continue;
+              }
+
+              debugLog("responses:forward", "[skip]");
+            }
+
+            res.write("data: [DONE]\n\n");
+            res.end();
+            logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength, durationMs: Date.now() - startedAt });
+          } catch (error) {
+            if (!res.writableEnded) res.end();
+            logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength, durationMs: Date.now() - startedAt });
+          }
+          return;
+        }
+
+        // Non-streaming: collect all text deltas
+        let fullText = "";
+        try {
+          for await (const sseEvent of stream.events) {
+            const { event, data } = sseEvent;
+            debugLog("workflow:event", sseEvent);
+            if (event === "response.created" && data?.response?.id) {
+              responseId = data.response.id;
+            }
+            if (event === "response.output_text.delta" && typeof data?.delta === "string") {
+              fullText += data.delta;
+            }
+          }
+        } catch {
+          // partial result is fine
+        }
+
+        const outputId = `msg_${created}`;
+        json(res, 200, {
+          id: responseId,
+          object: "response",
+          created_at: created,
+          model: agentModelId,
+          output: [
+            {
+              type: "message",
+              id: outputId,
+              role: "assistant",
+              status: "completed",
+              content: [{ type: "output_text", text: fullText, annotations: [] }],
+            },
+          ],
+        });
+        logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength: fullText.length, durationMs: Date.now() - startedAt });
+        return;
+      }
+
+      if (
+        req.method === "POST" &&
         (url.pathname === "/chat/completions" ||
           url.pathname === "/v1/chat/completions")
       ) {
@@ -530,6 +659,214 @@ export function createVeniceOpenAiProxyServer(
           return;
         }
 
+        // ── Agentic branch: route to workflow/chat when model === AGENTIC_MODEL_NAME ──
+        if (payload.model === AGENTIC_MODEL_NAME) {
+          const auth = await proxy.ensureAuth();
+          const agentModelId = proxy.agentic.agentModelId();
+          // agenticEventStream drives the full session: it keeps the outerface
+          // connection open until response.completed status=completed, and
+          // automatically re-enters with reconstructed history if the stream
+          // closes prematurely (e.g. a connection drop mid-tool-call).
+          const agentEvents = proxy.agentic.agenticEventStream(auth.login.clerkJwt, payload.messages);
+          const created = Math.floor(Date.now() / 1000);
+          let completionId = `chatcmpl_${created}`;
+          // Track which output_index holds reasoning vs message content
+          const itemTypes = {}; // output_index -> item type string
+
+          if (payload.stream) {
+            const streamStartedAt = Date.now();
+            let firstDeltaSent = false;
+            let contentLength = 0;
+            let reasoningLength = 0;
+
+            res.writeHead(200, {
+              "content-type": "text/event-stream; charset=utf-8",
+              "cache-control": "no-cache",
+              connection: "keep-alive",
+            });
+
+            try {
+              for await (const sseEvent of agentEvents) {
+                const { event, data } = sseEvent;
+                debugLog("workflow:event", sseEvent);
+
+                if (event === "response.created" && data?.response?.id) {
+                  completionId = data.response.id.replace(/^resp_/, "chatcmpl_");
+                }
+
+                if (event === "response.output_item.added") {
+                  itemTypes[data?.output_index ?? 0] = data?.item?.type ?? "message";
+                  debugLog("openai:chunk", "[skip]");
+                  continue;
+                }
+
+                if (event === "response.output_text.delta") {
+                  const idx = data?.output_index ?? 0;
+                  const isReasoning = itemTypes[idx] === "reasoning";
+                  const delta = data?.delta;
+                  if (typeof delta !== "string" || delta === "") {
+                    debugLog("openai:chunk", "[skip]");
+                    continue;
+                  }
+
+                  if (isReasoning) {
+                    reasoningLength += delta.length;
+                  } else {
+                    contentLength += delta.length;
+                  }
+
+                  const deltaObj = firstDeltaSent
+                    ? (isReasoning
+                        ? { content: null, reasoning_content: delta }
+                        : { content: delta, reasoning_content: null })
+                    : (isReasoning
+                        ? { role: "assistant", content: null, reasoning_content: delta }
+                        : { role: "assistant", content: delta, reasoning_content: null });
+                  firstDeltaSent = true;
+
+                  const chunk = {
+                    id: completionId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model: agentModelId,
+                    choices: [{ index: 0, delta: deltaObj, finish_reason: null, logprobs: null }],
+                    usage: null,
+                  };
+                  debugLog("openai:chunk", chunk);
+                  writeSseChunk(res, chunk);
+                  continue;
+                }
+
+                // Human-readable search progress line in reasoning_content.
+                if (event === "veniceai:web_search_call.searching" && typeof data?.query === "string") {
+                  const notification = `\n[web_search: "${data.query}"]\n`;
+                  reasoningLength += notification.length;
+                  const deltaObj = firstDeltaSent
+                    ? { content: null, reasoning_content: notification }
+                    : { role: "assistant", content: null, reasoning_content: notification };
+                  firstDeltaSent = true;
+                  const chunk = {
+                    id: completionId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model: agentModelId,
+                    choices: [{ index: 0, delta: deltaObj, finish_reason: null, logprobs: null }],
+                    usage: null,
+                  };
+                  debugLog("openai:chunk", chunk);
+                  writeSseChunk(res, chunk);
+                  continue;
+                }
+
+                // Machine-readable turn history — emitted at end of outerface session.
+                // Encodes reasoning items + function_call/function_call_output items so
+                // a subsequent turn can reconstruct the full workflow context.
+                if (event === "__vc:session_done__") {
+                  const items = data?.items;
+                  if (Array.isArray(items) && items.length > 0) {
+                    const encoded = Buffer.from(JSON.stringify(items)).toString("base64");
+                    const marker = `[__vc_hist__]${encoded}[/__vc_hist__]`;
+                    reasoningLength += marker.length;
+                    const deltaObj = firstDeltaSent
+                      ? { content: null, reasoning_content: marker }
+                      : { role: "assistant", content: null, reasoning_content: marker };
+                    firstDeltaSent = true;
+                    const chunk = {
+                      id: completionId,
+                      object: "chat.completion.chunk",
+                      created,
+                      model: agentModelId,
+                      choices: [{ index: 0, delta: deltaObj, finish_reason: null, logprobs: null }],
+                      usage: null,
+                    };
+                    debugLog("openai:chunk", chunk);
+                    writeSseChunk(res, chunk);
+                  }
+                  debugLog("openai:chunk", "[skip]");
+                  continue;
+                }
+
+                debugLog("openai:chunk", "[skip]");
+              }
+
+              writeSseChunk(res, {
+                id: completionId,
+                object: "chat.completion.chunk",
+                created,
+                model: agentModelId,
+                choices: [{ index: 0, delta: { content: "", reasoning_content: null }, finish_reason: "stop", logprobs: null }],
+                usage: null,
+              });
+              writeSseChunk(res, {
+                id: completionId,
+                object: "chat.completion.chunk",
+                created,
+                model: agentModelId,
+                choices: [],
+                usage: null,
+              });
+              res.write("data: [DONE]\n\n");
+              res.end();
+              logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength, reasoningLength, durationMs: Date.now() - startedAt, streamDurationMs: Date.now() - streamStartedAt });
+            } catch (error) {
+              if (!res.headersSent) throw error;
+              res.end();
+              logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength, reasoningLength, durationMs: Date.now() - startedAt, streamDurationMs: Date.now() - streamStartedAt });
+            }
+            return;
+          }
+
+          // Non-streaming agentic: collect all deltas, return a single chat.completion
+          let fullContent = "";
+          let fullReasoning = "";
+          try {
+            for await (const sseEvent of agentEvents) {
+              const { event, data } = sseEvent;
+              debugLog("workflow:event", sseEvent);
+
+              if (event === "response.created" && data?.response?.id) {
+                completionId = data.response.id.replace(/^resp_/, "chatcmpl_");
+              }
+              if (event === "response.output_item.added") {
+                itemTypes[data?.output_index ?? 0] = data?.item?.type ?? "message";
+              }
+              if (event === "response.output_text.delta" && typeof data?.delta === "string") {
+                const idx = data?.output_index ?? 0;
+                if (itemTypes[idx] === "reasoning") {
+                  fullReasoning += data.delta;
+                } else {
+                  fullContent += data.delta;
+                }
+              }
+              if (event === "veniceai:web_search_call.searching" && typeof data?.query === "string") {
+                fullReasoning += `\n[web_search: "${data.query}"]\n`;
+              }
+              if (event === "__vc:session_done__") {
+                const items = data?.items;
+                if (Array.isArray(items) && items.length > 0) {
+                  const encoded = Buffer.from(JSON.stringify(items)).toString("base64");
+                  fullReasoning += `[__vc_hist__]${encoded}[/__vc_hist__]`;
+                }
+              }
+            }
+          } catch {
+            // partial result is fine
+          }
+
+          const message = { role: "assistant", content: fullContent };
+          if (fullReasoning) message.reasoning_content = fullReasoning;
+          json(res, 200, {
+            id: completionId,
+            object: "chat.completion",
+            created,
+            model: agentModelId,
+            choices: [{ index: 0, finish_reason: "stop", message }],
+          });
+          logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength: fullContent.length, reasoningLength: fullReasoning.length, durationMs: Date.now() - startedAt });
+          return;
+        }
+        // ── End agentic branch ──
+
         if (payload.stream) {
           const streamStartedAt = Date.now();
           const created = Math.floor(Date.now() / 1000);
@@ -548,6 +885,7 @@ export function createVeniceOpenAiProxyServer(
           try {
             for await (const event of stream.events) {
               updateStreamStats(stats, event);
+              debugLog("venice:event", event);
 
               if (
                 event?.kind === "meta" &&
@@ -563,6 +901,7 @@ export function createVeniceOpenAiProxyServer(
               }
 
               if (event?.kind !== "content") {
+                debugLog("openai:chunk", "[skip]");
                 continue;
               }
 
@@ -577,6 +916,7 @@ export function createVeniceOpenAiProxyServer(
                   : null;
 
               if (contentVal === null && reasoningVal === null) {
+                debugLog("openai:chunk", "[skip]");
                 continue;
               }
 
@@ -589,7 +929,7 @@ export function createVeniceOpenAiProxyServer(
                   };
               firstDeltaSent = true;
 
-              writeSseChunk(res, {
+              const chunk = {
                 choices: [
                   { delta, finish_reason: null, index: 0, logprobs: null },
                 ],
@@ -598,7 +938,9 @@ export function createVeniceOpenAiProxyServer(
                 created,
                 model: servingModelId,
                 id: completionId,
-              });
+              };
+              debugLog("openai:chunk", chunk);
+              writeSseChunk(res, chunk);
             }
 
             if (!firstDeltaSent) {
@@ -766,7 +1108,8 @@ export function startVeniceOpenAiProxyServer({
 
 async function main() {
   const { host, port } = await startVeniceOpenAiProxyServer();
-  console.log(`Venice OpenAI proxy listening on http://${host}:${port}`);
+  console.log(`Venice OpenAI proxy listening on http://${host}:${port}` );
+  debugLog("main", "Debug mode on!")
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

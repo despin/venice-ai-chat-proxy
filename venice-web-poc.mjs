@@ -28,6 +28,20 @@ const BROWSER_CORS_HEADERS = {
   "sec-fetch-mode": "cors",
 };
 
+const DEBUG = Boolean(process.env.VENICE_DEBUG?.trim());
+
+function debugLog(label, data) {
+  if (!DEBUG) return;
+  const prefix = `[debug:${label}]`;
+  if (data === undefined) {
+    process.stderr.write(`${prefix}\n`);
+  } else if (typeof data === "string") {
+    process.stderr.write(`${prefix} ${data}\n`);
+  } else {
+    process.stderr.write(`${prefix}\n${JSON.stringify(data, null, 2)}\n`);
+  }
+}
+
 let cachedLoginConfig;
 
 function readLoginConfig() {
@@ -80,6 +94,59 @@ function safeJsonParse(text) {
     return JSON.parse(text);
   } catch {
     return text;
+  }
+}
+
+async function* parseSseStream(stream) {
+  if (!stream) return;
+
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let boundary;
+      while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+
+        let eventName = null;
+        let dataLine = null;
+
+        for (const line of block.split("\n")) {
+          if (line.startsWith("event:")) {
+            eventName = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            dataLine = line.slice(5).trim();
+          }
+        }
+
+        if (dataLine !== null) {
+          yield { event: eventName, data: safeJsonParse(dataLine) };
+        }
+      }
+    }
+
+    buffer += decoder.decode();
+    const remaining = buffer.trim();
+    if (remaining) {
+      let eventName = null;
+      let dataLine = null;
+      for (const line of remaining.split("\n")) {
+        if (line.startsWith("event:")) eventName = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLine = line.slice(5).trim();
+      }
+      if (dataLine !== null) {
+        yield { event: eventName, data: safeJsonParse(dataLine) };
+      }
+    }
+  } finally {
+    reader.releaseLock();
   }
 }
 
@@ -624,6 +691,23 @@ export class VeniceWebClient {
     const promptMessages = Array.isArray(options.promptMessages)
       ? options.promptMessages
       : [{ role: "user", content: input }];
+    const requestBody = {
+      clientProcessingTime: 0,
+      conversationType: "text",
+      includeVeniceSystemPrompt: true,
+      isCharacter: false,
+      modelId: options.model || this.model,
+      prompt: promptMessages,
+      reasoning: Boolean(options.reasoning),
+      requestId: options.requestId || crypto.randomBytes(4).toString("base64url"),
+      simpleMode: false,
+      systemPrompt: options.systemPrompt || "",
+      userId: this.userId,
+      webEnabled: false,
+      webScrapeEnabled: false,
+      xSearchEnabled: false,
+    };
+    debugLog("outerface:req", { method: "POST", path: "/api/inference/chat", body: requestBody });
     const response = await this.request(`${OUTFACE_BASE_URL}/api/inference/chat`, {
       method: "POST",
       headers: {
@@ -633,22 +717,7 @@ export class VeniceWebClient {
           "x-venice-middleface-version": this.middlefaceVersion,
         }),
       },
-      body: JSON.stringify({
-        clientProcessingTime: 0,
-        conversationType: "text",
-        includeVeniceSystemPrompt: true,
-        isCharacter: false,
-        modelId: options.model || this.model,
-        prompt: promptMessages,
-        reasoning: Boolean(options.reasoning),
-        requestId: options.requestId || crypto.randomBytes(4).toString("base64url"),
-        simpleMode: false,
-        systemPrompt: options.systemPrompt || "",
-        userId: this.userId,
-        webEnabled: false,
-        webScrapeEnabled: false,
-        xSearchEnabled: false,
-      }),
+      body: JSON.stringify(requestBody),
     });
 
     const text = await response.text();
@@ -676,6 +745,23 @@ export class VeniceWebClient {
     const promptMessages = Array.isArray(options.promptMessages)
       ? options.promptMessages
       : [{ role: "user", content: input }];
+    const requestBody = {
+      clientProcessingTime: 0,
+      conversationType: "text",
+      includeVeniceSystemPrompt: true,
+      isCharacter: false,
+      modelId: options.model || this.model,
+      prompt: promptMessages,
+      reasoning: Boolean(options.reasoning),
+      requestId: options.requestId || crypto.randomBytes(4).toString("base64url"),
+      simpleMode: false,
+      systemPrompt: options.systemPrompt || "",
+      userId: this.userId,
+      webEnabled: false,
+      webScrapeEnabled: false,
+      xSearchEnabled: false,
+    };
+    debugLog("outerface:req", { method: "POST", path: "/api/inference/chat", body: requestBody });
     const response = await this.request(`${OUTFACE_BASE_URL}/api/inference/chat`, {
       method: "POST",
       headers: {
@@ -685,22 +771,7 @@ export class VeniceWebClient {
           "x-venice-middleface-version": this.middlefaceVersion,
         }),
       },
-      body: JSON.stringify({
-        clientProcessingTime: 0,
-        conversationType: "text",
-        includeVeniceSystemPrompt: true,
-        isCharacter: false,
-        modelId: options.model || this.model,
-        prompt: promptMessages,
-        reasoning: Boolean(options.reasoning),
-        requestId: options.requestId || crypto.randomBytes(4).toString("base64url"),
-        simpleMode: false,
-        systemPrompt: options.systemPrompt || "",
-        userId: this.userId,
-        webEnabled: false,
-        webScrapeEnabled: false,
-        xSearchEnabled: false,
-      }),
+      body: JSON.stringify(requestBody),
     });
 
     if (!response.ok) {
@@ -711,6 +782,39 @@ export class VeniceWebClient {
     return {
       response,
       events: parseJsonLineStream(response.body),
+    };
+  }
+
+  async openWorkflowChatStream(jwt, messages, options = {}) {
+    const agentModelId = options.agentModelId || "kimi-k2-5";
+    const requestBody = { input: { messages } };
+    debugLog("outerface:req", {
+      method: "POST",
+      path: `/api/inference/workflow/chat?agentModelId=${agentModelId}`,
+      body: requestBody,
+    });
+    const response = await this.request(
+      `${OUTFACE_BASE_URL}/api/inference/workflow/chat?agentModelId=${encodeURIComponent(agentModelId)}`,
+      {
+        method: "POST",
+        headers: {
+          ...this.outerfaceHeaders(jwt, {
+            accept: "text/event-stream",
+            "content-type": "application/json",
+          }),
+        },
+        body: JSON.stringify(requestBody),
+      },
+    );
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`HTTP ${response.status}: ${text}`);
+    }
+
+    return {
+      response,
+      events: parseSseStream(response.body),
     };
   }
 
