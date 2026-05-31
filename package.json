@@ -2,6 +2,7 @@
   "scripts": {
     "check:concurrency": "node ./check-proxy-concurrency.mjs",
     "check:models": "node ./check-proxy-models.mjs",
+    "check:openai-client": "node ./check-proxy-openai-client.mjs",
     "clean-session": "node ./venice-login.mjs --clean-session",
     "convert:chat": "node ./convert-venice-chat.mjs",
     "login": "node ./venice-login.mjs",
@@ -13,6 +14,7 @@
     "start": "node ./venice-start.mjs"
   },
   "dependencies": {
+    "openai": "^6.39.1",
     "wreq-js": "^2.3.0"
   }
 }
