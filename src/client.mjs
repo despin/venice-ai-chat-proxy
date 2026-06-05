@@ -707,6 +707,12 @@ export class VeniceWebClient {
       webScrapeEnabled: false,
       xSearchEnabled: false,
     };
+    if (typeof options.temperature === "number") {
+      requestBody.temperature = options.temperature;
+    }
+    if (typeof options.topP === "number") {
+      requestBody.topP = options.topP;
+    }
     debugLog("outerface:req", { method: "POST", path: "/api/inference/chat", body: requestBody });
     const response = await this.request(`${OUTFACE_BASE_URL}/api/inference/chat`, {
       method: "POST",
@@ -761,6 +767,12 @@ export class VeniceWebClient {
       webScrapeEnabled: false,
       xSearchEnabled: false,
     };
+    if (typeof options.temperature === "number") {
+      requestBody.temperature = options.temperature;
+    }
+    if (typeof options.topP === "number") {
+      requestBody.topP = options.topP;
+    }
     debugLog("outerface:req", { method: "POST", path: "/api/inference/chat", body: requestBody });
     const response = await this.request(`${OUTFACE_BASE_URL}/api/inference/chat`, {
       method: "POST",

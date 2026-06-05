@@ -314,6 +314,32 @@ function updateStreamStats(stats, event) {
   }
 }
 
+function isTeeModel(model) {
+  return typeof model === "string" && model.startsWith("e2ee-");
+}
+
+function buildVeniceChatOptions({ payload, model, prompt, systemPrompt, requestId }) {
+  const options = {
+    model,
+    promptMessages: prompt,
+    systemPrompt,
+    requestId,
+    reasoning:
+      typeof payload.reasoning === "boolean"
+        ? payload.reasoning
+        : !isTeeModel(model),
+  };
+
+  if (typeof payload.temperature === "number") {
+    options.temperature = payload.temperature;
+  }
+  if (typeof payload.top_p === "number") {
+    options.topP = payload.top_p;
+  }
+
+  return options;
+}
+
 class VeniceOpenAiProxy {
   constructor() {
     this.client = new VeniceWebClient();
@@ -426,13 +452,11 @@ class VeniceOpenAiProxy {
     return await retryModelOverloaded(
       async () => {
         const requestId = Math.random().toString(36).slice(2, 9);
-        return await this.client.chat(auth.login.clerkJwt, undefined, {
-          model,
-          promptMessages: prompt,
-          systemPrompt,
-          requestId,
-          reasoning: true,
-        });
+        return await this.client.chat(
+          auth.login.clerkJwt,
+          undefined,
+          buildVeniceChatOptions({ payload, model, prompt, systemPrompt, requestId }),
+        );
       },
       { label: "chat completion", model },
     );
@@ -449,13 +473,11 @@ class VeniceOpenAiProxy {
     return await retryModelOverloaded(
       async () => {
         const requestId = Math.random().toString(36).slice(2, 9);
-        return await this.client.openChatStream(auth.login.clerkJwt, undefined, {
-          model,
-          promptMessages: prompt,
-          systemPrompt,
-          requestId,
-          reasoning: true,
-        });
+        return await this.client.openChatStream(
+          auth.login.clerkJwt,
+          undefined,
+          buildVeniceChatOptions({ payload, model, prompt, systemPrompt, requestId }),
+        );
       },
       { label: "chat completion stream", model },
     );
