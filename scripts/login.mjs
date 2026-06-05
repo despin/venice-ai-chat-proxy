@@ -3,9 +3,9 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { readFile, rm } from "node:fs/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { VeniceWebClient } from "./venice-web-poc.mjs";
+import { VeniceWebClient } from "../src/client.mjs";
 
-const CREDENTIALS_FILE = new URL("./venice-login.json", import.meta.url);
+const CREDENTIALS_FILE = new URL("../venice-login.json", import.meta.url);
 const DEFAULT_SESSION_FILE = ".venice-web-session.json";
 
 async function readCredentialsFile() {
@@ -55,7 +55,7 @@ function askHidden(question) {
 }
 
 async function loginWithWreq(options) {
-  const { loginWithWreq: login } = await import("./venice-login-wreq.mjs");
+  const { loginWithWreq: login } = await import("./login-wreq.mjs");
   return login(options);
 }
 

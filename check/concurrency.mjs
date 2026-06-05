@@ -1,5 +1,5 @@
 import { pathToFileURL } from "node:url";
-import { startVeniceOpenAiProxyServer } from "./venice-openai-proxy.mjs";
+import { startVeniceOpenAiProxyServer } from "../src/proxy.mjs";
 
 const DEFAULT_PROMPTS = [
   "Concurrency test stream A. Count slowly from 1 to 40, one number per short sentence.",

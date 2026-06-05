@@ -10,13 +10,10 @@ COPY package.json package-lock.json ./
 
 RUN npm ci --omit=dev
 
-COPY venice-web-poc.mjs ./
-COPY venice-openai-proxy.mjs ./
-COPY venice-login.mjs ./
-COPY venice-login-wreq.mjs ./
-COPY venice-start.mjs ./
-COPY check-proxy-models.mjs ./
-COPY convert-venice-chat.mjs ./
+COPY src/ src/
+COPY scripts/ scripts/
+COPY check/models.mjs check/
+COPY index.mjs ./
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
@@ -27,4 +24,4 @@ VOLUME ["/data"]
 
 EXPOSE 3456
 
-CMD ["node", "./venice-start.mjs"]
+CMD ["node", "./index.mjs"]

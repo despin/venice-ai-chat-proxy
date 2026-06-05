@@ -1,17 +1,17 @@
 {
   "scripts": {
-    "check:concurrency": "node ./check-proxy-concurrency.mjs",
-    "check:models": "node ./check-proxy-models.mjs",
-    "check:openai-client": "node ./check-proxy-openai-client.mjs",
-    "clean-session": "node ./venice-login.mjs --clean-session",
-    "convert:chat": "node ./convert-venice-chat.mjs",
-    "login": "node ./venice-login.mjs",
-    "login:direct": "node ./venice-login.mjs --direct",
-    "login:restore": "node ./venice-login.mjs --restore",
-    "login:restore-only": "node ./venice-login.mjs --restore-only",
-    "poc": "node ./venice-web-poc.mjs",
-    "proxy": "node ./venice-openai-proxy.mjs",
-    "start": "node ./venice-start.mjs"
+    "check:concurrency": "node ./check/concurrency.mjs",
+    "check:models": "node ./check/models.mjs",
+    "check:openai-client": "node ./check/openai.mjs",
+    "clean-session": "node ./scripts/login.mjs --clean-session",
+    "convert:chat": "node ./scripts/convert.mjs",
+    "login": "node ./scripts/login.mjs",
+    "login:direct": "node ./scripts/login.mjs --direct",
+    "login:restore": "node ./scripts/login.mjs --restore",
+    "login:restore-only": "node ./scripts/login.mjs --restore-only",
+    "poc": "node ./src/client.mjs",
+    "proxy": "node ./src/proxy.mjs",
+    "start": "node ./index.mjs"
   },
   "dependencies": {
     "openai": "^6.39.1",

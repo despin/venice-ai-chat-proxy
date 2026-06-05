@@ -1,11 +1,11 @@
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
-import { VeniceWebClient } from "./venice-web-poc.mjs";
-import { startVeniceOpenAiProxyServer } from "./venice-openai-proxy.mjs";
+import { VeniceWebClient } from "./src/client.mjs";
+import { startVeniceOpenAiProxyServer } from "./src/proxy.mjs";
 
 function runLoginUtility(args = []) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["./venice-login.mjs", ...args], {
+    const child = spawn(process.execPath, ["./scripts/login.mjs", ...args], {
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";

@@ -1,7 +1,7 @@
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { VeniceWebClient } from "./venice-web-poc.mjs";
-import { AgenticProxy } from "./venice-agentic-proxy.mjs";
+import { VeniceWebClient } from "./client.mjs";
+import { AgenticProxy } from "./agentic.mjs";
 
 const PORT = Number(process.env.PORT || process.env.VENICE_PROXY_PORT || 3456);
 const HOST = process.env.HOST || "0.0.0.0";

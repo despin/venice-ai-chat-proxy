@@ -1,5 +1,5 @@
 import { pathToFileURL } from "node:url";
-import { startVeniceOpenAiProxyServer } from "./venice-openai-proxy.mjs";
+import { startVeniceOpenAiProxyServer } from "../src/proxy.mjs";
 
 const REPEATS = Number(process.env.CHECK_PROXY_MODELS_REPEATS || 3);
 
