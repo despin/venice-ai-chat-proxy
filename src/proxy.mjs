@@ -16,6 +16,12 @@ const MODEL_OVERLOADED_RETRY_DELAY_MS = Number(
 );
 const DEBUG = Boolean(process.env.VENICE_DEBUG?.trim());
 const AGENTIC_MODEL_NAME = process.env.VENICE_AGENTIC_MODEL_NAME?.trim() || "agentic";
+const MODEL_SUFFIX_BOOLEAN_FIELDS = new Set([
+  "includeVeniceSystemPrompt",
+  "webEnabled",
+  "webScrapeEnabled",
+  "xSearchEnabled",
+]);
 
 function debugLog(label, data) {
   if (!DEBUG) return;
@@ -318,16 +324,88 @@ function isTeeModel(model) {
   return typeof model === "string" && model.startsWith("e2ee-");
 }
 
+function parseBooleanSuffixValue(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  switch (value.trim().toLowerCase()) {
+    case "true":
+    case "1":
+    case "on":
+    case "yes":
+      return true;
+    case "false":
+    case "0":
+    case "off":
+    case "no":
+      return false;
+    default:
+      return null;
+  }
+}
+
+function parseModelFeatureSuffix(model) {
+  if (typeof model !== "string") {
+    return { model, features: {} };
+  }
+
+  const separatorIndex = model.indexOf(":");
+  if (separatorIndex === -1) {
+    return { model, features: {} };
+  }
+
+  const baseModel = model.slice(0, separatorIndex);
+  const suffix = model.slice(separatorIndex + 1);
+  if (!baseModel || !suffix.includes("=")) {
+    return { model, features: {} };
+  }
+
+  const features = {};
+  for (const part of suffix.split("&")) {
+    const equalsIndex = part.indexOf("=");
+    if (equalsIndex <= 0) {
+      continue;
+    }
+
+    const rawName = part.slice(0, equalsIndex);
+    const rawValue = part.slice(equalsIndex + 1);
+    let name;
+    let value;
+    try {
+      name = decodeURIComponent(rawName);
+      value = decodeURIComponent(rawValue);
+    } catch {
+      name = rawName;
+      value = rawValue;
+    }
+
+    if (!MODEL_SUFFIX_BOOLEAN_FIELDS.has(name)) {
+      continue;
+    }
+
+    const parsedValue = parseBooleanSuffixValue(value);
+    if (parsedValue !== null) {
+      features[name] = parsedValue;
+    }
+  }
+
+  return Object.keys(features).length > 0
+    ? { model: baseModel, features }
+    : { model, features: {} };
+}
+
 function buildVeniceChatOptions({ payload, model, prompt, systemPrompt, requestId }) {
+  const parsedModel = parseModelFeatureSuffix(model);
   const options = {
-    model,
+    model: parsedModel.model,
     promptMessages: prompt,
     systemPrompt,
     requestId,
     reasoning:
       typeof payload.reasoning === "boolean"
         ? payload.reasoning
-        : !isTeeModel(model),
+        : !isTeeModel(parsedModel.model),
+    ...parsedModel.features,
   };
 
   if (typeof payload.temperature === "number") {

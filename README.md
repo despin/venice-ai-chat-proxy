@@ -134,6 +134,32 @@ In Open WebUI, add an OpenAI-compatible connection with:
 - Base URL: `http://127.0.0.1:3456/v1`
 - API key: any non-empty value if the UI requires one
 
+### Model feature suffix
+
+For clients that only let you edit the model string, the proxy supports a small
+subset of Venice-style model feature suffixes:
+
+```text
+<model_id>:<parameter>=<value>&<parameter>=<value>
+```
+
+Supported parameters are:
+
+- `includeVeniceSystemPrompt`
+- `webEnabled`
+- `webScrapeEnabled`
+- `xSearchEnabled`
+
+Values may be `true`/`false`, `1`/`0`, `on`/`off`, or `yes`/`no`.
+
+Examples:
+
+```text
+qwen3-4b:includeVeniceSystemPrompt=false
+qwen3-4b:webEnabled=true&webScrapeEnabled=true
+qwen3-4b:webEnabled=true&xSearchEnabled=true
+```
+
 If Open WebUI runs in Docker and the proxy runs on the host, use:
 
 - `http://host.docker.internal:3456/v1`

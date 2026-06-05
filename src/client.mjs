@@ -694,7 +694,10 @@ export class VeniceWebClient {
     const requestBody = {
       clientProcessingTime: 0,
       conversationType: "text",
-      includeVeniceSystemPrompt: true,
+      includeVeniceSystemPrompt:
+        typeof options.includeVeniceSystemPrompt === "boolean"
+          ? options.includeVeniceSystemPrompt
+          : true,
       isCharacter: false,
       modelId: options.model || this.model,
       prompt: promptMessages,
@@ -703,9 +706,9 @@ export class VeniceWebClient {
       simpleMode: false,
       systemPrompt: options.systemPrompt || "",
       userId: this.userId,
-      webEnabled: false,
-      webScrapeEnabled: false,
-      xSearchEnabled: false,
+      webEnabled: Boolean(options.webEnabled),
+      webScrapeEnabled: Boolean(options.webScrapeEnabled),
+      xSearchEnabled: Boolean(options.xSearchEnabled),
     };
     if (typeof options.temperature === "number") {
       requestBody.temperature = options.temperature;
@@ -754,7 +757,10 @@ export class VeniceWebClient {
     const requestBody = {
       clientProcessingTime: 0,
       conversationType: "text",
-      includeVeniceSystemPrompt: true,
+      includeVeniceSystemPrompt:
+        typeof options.includeVeniceSystemPrompt === "boolean"
+          ? options.includeVeniceSystemPrompt
+          : true,
       isCharacter: false,
       modelId: options.model || this.model,
       prompt: promptMessages,
@@ -763,9 +769,9 @@ export class VeniceWebClient {
       simpleMode: false,
       systemPrompt: options.systemPrompt || "",
       userId: this.userId,
-      webEnabled: false,
-      webScrapeEnabled: false,
-      xSearchEnabled: false,
+      webEnabled: Boolean(options.webEnabled),
+      webScrapeEnabled: Boolean(options.webScrapeEnabled),
+      xSearchEnabled: Boolean(options.xSearchEnabled),
     };
     if (typeof options.temperature === "number") {
       requestBody.temperature = options.temperature;
