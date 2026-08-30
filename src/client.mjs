@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { createSession } from "wreq-js";
 
 const VENICE_ORIGIN = "https://venice.ai";
 const CLERK_BASE_URL = "https://clerk.venice.ai";
@@ -291,6 +292,23 @@ class CookieJar {
       }));
   }
 
+  upsert(record) {
+    if (!record?.name || !record.domain) {
+      return;
+    }
+    const index = this.cookies.findIndex(
+      (cookie) =>
+        cookie.name === record.name &&
+        cookie.domain.toLowerCase() === record.domain.toLowerCase() &&
+        cookie.path === record.path,
+    );
+    if (index >= 0) {
+      this.cookies[index] = record;
+    } else {
+      this.cookies.push(record);
+    }
+  }
+
   #setCookie(url, raw) {
     if (!raw) {
       return;
@@ -371,6 +389,7 @@ export class VeniceWebClient {
     prompt = process.env.VENICE_PROMPT?.trim() || DEFAULT_PROMPT,
     sessionFile = credentialValue("VENICE_SESSION_FILE") || DEFAULT_SESSION_FILE,
     fetchImpl = globalThis.fetch,
+    transport = process.env.VENICE_HTTP_TRANSPORT?.trim() || "wreq",
   } = {}) {
     if (typeof fetchImpl !== "function") {
       throw new Error("Global fetch is required.");
@@ -381,6 +400,11 @@ export class VeniceWebClient {
     this.prompt = prompt;
     this.sessionFile = sessionFile;
     this.fetch = fetchImpl;
+    // Cloudflare rejects plain Node fetch on the inference endpoints, so requests
+    // go through a wreq browser-fingerprinted session unless explicitly disabled.
+    this.transport = transport === "fetch" ? "fetch" : "wreq";
+    this.wreqSession = null;
+    this.wreqSeeded = false;
     this.cookies = new CookieJar();
     this.veniceVersion = DEFAULT_VENICE_VERSION;
     this.middlefaceVersion = DEFAULT_MIDDLEFACE_VERSION;
@@ -389,6 +413,69 @@ export class VeniceWebClient {
     this.userId = null;
     this.sessionId = null;
     this.clerkJwt = null;
+  }
+
+  async ensureWreqSession() {
+    if (!this.wreqSession) {
+      this.wreqSession = await createSession({
+        browser: process.env.VENICE_WREQ_BROWSER || "chrome_131",
+        os: process.env.VENICE_WREQ_OS || "macos",
+        defaultHeaders: {
+          "user-agent": USER_AGENT,
+          accept: "*/*",
+          ...BROWSER_CLIENT_HINT_HEADERS,
+        },
+      });
+    }
+
+    if (!this.wreqSeeded) {
+      for (const cookie of this.cookies.export()) {
+        const host = String(cookie.domain || "").replace(/^\./, "");
+        if (!host) {
+          continue;
+        }
+        this.wreqSession.setCookie(cookie.name, cookie.value, `https://${host}${cookie.path || "/"}`);
+      }
+      this.wreqSeeded = true;
+    }
+
+    return this.wreqSession;
+  }
+
+  // The wreq session owns the live cookie jar; mirror it back so the saved session
+  // file stays current. Cookies we seeded into wreq come back without a domain, so
+  // they are skipped here and the restored entry is kept as-is.
+  syncCookiesFromWreq() {
+    if (!this.wreqSession) {
+      return;
+    }
+    for (const cookie of this.wreqSession.getAllCookies()) {
+      if (!cookie?.domain) {
+        continue;
+      }
+      this.cookies.upsert({
+        name: cookie.name,
+        value: cookie.value,
+        domain: cookie.domain,
+        path: cookie.path || "/",
+        secure: Boolean(cookie.secure),
+        httpOnly: Boolean(cookie.httpOnly),
+        hostOnly: !String(cookie.domain).startsWith("."),
+        expiresAt:
+          typeof cookie.expiresAtMs === "number" && Number.isFinite(cookie.expiresAtMs)
+            ? cookie.expiresAtMs
+            : null,
+      });
+    }
+  }
+
+  async close() {
+    if (this.wreqSession) {
+      const session = this.wreqSession;
+      this.wreqSession = null;
+      this.wreqSeeded = false;
+      await session.close();
+    }
   }
 
   async request(url, init = {}) {
@@ -401,6 +488,16 @@ export class VeniceWebClient {
     }
     if (!headers.has("accept")) {
       headers.set("accept", "*/*");
+    }
+
+    if (this.transport === "wreq") {
+      const session = await this.ensureWreqSession();
+      const response = await session.fetch(url, {
+        ...init,
+        headers: Object.fromEntries(headers.entries()),
+      });
+      this.syncCookiesFromWreq();
+      return response;
     }
 
     const cookieHeader = this.cookies.getCookieHeader(url);
@@ -887,6 +984,27 @@ export class VeniceWebClient {
     };
   }
 
+  // Mints a fresh Clerk JWT from the in-memory session/cookies, skipping the
+  // sign-in page + environment + client bootstrap that a cold restore needs.
+  async refreshClerkJwt() {
+    if (!this.sessionId) {
+      throw new Error("No Clerk session id available to refresh.");
+    }
+
+    const touched = await this.touchSession(this.sessionId);
+    let jwt = touched?.response?.last_active_token?.jwt ?? null;
+    if (!jwt) {
+      const tokenResponse = await this.mintSessionToken(this.sessionId);
+      jwt = tokenResponse?.jwt ?? null;
+    }
+    if (!jwt) {
+      throw new Error("Could not mint a Clerk session JWT from the active session.");
+    }
+
+    this.clerkJwt = jwt;
+    return jwt;
+  }
+
   async restoreSessionFromCookies() {
     await this.bootstrap();
     const clerkClient = await this.getClerkClient();
@@ -981,6 +1099,7 @@ export class VeniceWebClient {
         ? snapshot.middlefaceVersion
         : this.middlefaceVersion;
     this.cookies.import(snapshot.cookies);
+    this.wreqSeeded = false;
   }
 
   hasUsableSavedJwt(snapshot) {
@@ -1049,7 +1168,14 @@ export class VeniceWebClient {
 
 async function main() {
   const client = new VeniceWebClient();
+  try {
+    await runDemo(client);
+  } finally {
+    await client.close();
+  }
+}
 
+async function runDemo(client) {
   const auth = await client.ensureAuthenticated();
   await client.toggleMode(auth.login.clerkJwt, false);
   const embedding = await client.createEmbedding(auth.login.clerkJwt);

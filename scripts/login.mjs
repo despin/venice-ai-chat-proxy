@@ -59,6 +59,33 @@ async function loginWithWreq(options) {
   return login(options);
 }
 
+async function completeMfaLogin(options) {
+  const { completeWreqMfaLogin } = await import("./login-wreq.mjs");
+  return completeWreqMfaLogin(options);
+}
+
+function readMfaCodeArg() {
+  const fromEnv = process.env.VENICE_MFA_CODE?.trim();
+  const index = process.argv.findIndex(
+    (arg) => arg === "--mfa-code" || arg.startsWith("--mfa-code="),
+  );
+  if (index === -1) {
+    return fromEnv || null;
+  }
+
+  const arg = process.argv[index];
+  const inline = arg.startsWith("--mfa-code=") ? arg.slice("--mfa-code=".length).trim() : "";
+  if (inline) {
+    return inline;
+  }
+
+  const next = process.argv[index + 1];
+  if (next && !next.startsWith("--")) {
+    return next.trim();
+  }
+  return fromEnv || "";
+}
+
 async function loginDirect(client) {
   const login = await client.login();
   const userSession = await client.getUserSession(login.clerkJwt);
@@ -166,10 +193,31 @@ async function main() {
   const restoreFlag = process.argv.includes("--restore");
   const restoreOnlyFlag = process.argv.includes("--restore-only");
   const directOnly = process.argv.includes("--direct");
+  const mfaFlag = process.argv.some(
+    (arg) => arg === "--mfa-code" || arg.startsWith("--mfa-code="),
+  );
   const credentials = await readCredentialsFile();
 
   if (cleanSessionFlag) {
     console.log(JSON.stringify(await cleanSessionData(credentials), null, 2));
+    return;
+  }
+
+  if (mfaFlag || process.env.VENICE_MFA_CODE?.trim()) {
+    const code = readMfaCodeArg() || (await ask("Two-factor code: "));
+    if (!code) {
+      throw new Error("A two-factor code is required.");
+    }
+    // The pending state already records the session file chosen in step one; an
+    // explicit VENICE_SESSION_FILE still wins.
+    const sessionFile = process.env.VENICE_SESSION_FILE?.trim();
+    console.log(
+      JSON.stringify(
+        await completeMfaLogin({ code, ...(sessionFile ? { sessionFile } : {}) }),
+        null,
+        2,
+      ),
+    );
     return;
   }
 
@@ -188,17 +236,28 @@ async function main() {
     email,
     password,
     ...(sessionFile ? { sessionFile } : {}),
+    // --direct is the plain-fetch debugging path, so keep it off the wreq transport.
+    ...(directOnly ? { transport: "fetch" } : {}),
   });
 
-  const result = restoreOnlyFlag
-    ? await restoreOnly(client)
-    : restoreFlag
-      ? await restoreWithDirectFallback(client)
-      : directOnly
-        ? await loginDirect(client)
-        : await loginWithWreq({ email, password, sessionFile: client.sessionFile });
+  let result;
+  try {
+    result = restoreOnlyFlag
+      ? await restoreOnly(client)
+      : restoreFlag
+        ? await restoreWithDirectFallback(client)
+        : directOnly
+          ? await loginDirect(client)
+          : await loginWithWreq({ email, password, sessionFile: client.sessionFile });
+  } finally {
+    await client.close();
+  }
 
   console.log(JSON.stringify(result, null, 2));
+
+  if (result?.status === "needs_second_factor") {
+    process.exitCode = 2;
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

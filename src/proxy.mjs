@@ -1,6 +1,6 @@
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { VeniceWebClient } from "./client.mjs";
+import { VeniceWebClient, decodeJwtPayload } from "./client.mjs";
 import { AgenticProxy } from "./agentic.mjs";
 
 const PORT = Number(process.env.PORT || process.env.VENICE_PROXY_PORT || 3456);
@@ -15,6 +15,8 @@ const MODEL_OVERLOADED_RETRY_DELAY_MS = Number(
   process.env.VENICE_MODEL_OVERLOADED_RETRY_DELAY_MS || 750,
 );
 const DEBUG = Boolean(process.env.VENICE_DEBUG?.trim());
+// Clerk JWTs live about a minute; refresh a little before they lapse.
+const AUTH_REFRESH_SKEW_MS = Number(process.env.VENICE_AUTH_REFRESH_SKEW_MS || 10_000);
 const AGENTIC_MODEL_NAME = process.env.VENICE_AGENTIC_MODEL_NAME?.trim() || "agentic";
 const MODEL_SUFFIX_BOOLEAN_FIELDS = new Set([
   "includeVeniceSystemPrompt",
@@ -177,6 +179,10 @@ function isModelOverloadedError(error) {
     error.message.startsWith("HTTP 429:") &&
     error.message.includes('"error":"modelOverloaded"')
   );
+}
+
+function isUnauthorizedError(error) {
+  return error instanceof Error && error.message.startsWith("HTTP 401:");
 }
 
 async function retryModelOverloaded(operation, { label, model }) {
@@ -423,6 +429,8 @@ class VeniceOpenAiProxy {
     this.client = new VeniceWebClient();
     this.agentic = new AgenticProxy(this.client);
     this.authPromise = null;
+    this.auth = null;
+    this.authExpiresAt = 0;
   }
 
   buildMissingSessionError() {
@@ -431,70 +439,138 @@ class VeniceOpenAiProxy {
     );
   }
 
+  cacheAuth(auth) {
+    const expiresAt = decodeJwtPayload(auth.login.clerkJwt)?.exp;
+    this.auth = auth;
+    this.authExpiresAt = typeof expiresAt === "number" ? expiresAt * 1000 : 0;
+    return auth;
+  }
+
+  invalidateAuth() {
+    this.auth = null;
+    this.authExpiresAt = 0;
+  }
+
+  hasFreshAuth() {
+    return Boolean(this.auth) && this.authExpiresAt > Date.now() + AUTH_REFRESH_SKEW_MS;
+  }
+
   async ensureAuth() {
+    if (this.hasFreshAuth()) {
+      return this.auth;
+    }
+
     if (!this.authPromise) {
-      this.authPromise = (async () => {
-        const saved = this.client.readSavedSession();
-        if (!saved) {
-          throw this.buildMissingSessionError();
-        }
-
-        this.client.restoreSavedSession(saved);
-        if (this.client.hasUsableSavedJwt(saved)) {
-          try {
-            const userSession = await this.client.getUserSession(
-              saved.clerkJwt,
-            );
-            this.client.writeSavedSession({ lastValidatedAt: Date.now() });
-            return {
-              source: "session",
-              login: {
-                signInAttemptId: null,
-                sessionId: this.client.sessionId,
-                clerkJwt: this.client.clerkJwt,
-              },
-              userSession,
-            };
-          } catch {
-            this.client.restoreSavedSession(saved);
-          }
-        }
-
-        try {
-          const restored = await this.client.restoreSessionFromCookies();
-          const userSession = await this.client.getUserSession(
-            restored.clerkJwt,
-          );
-          this.client.writeSavedSession({
-            lastValidatedAt: Date.now(),
-            restoredAt: Date.now(),
-          });
-          return {
-            source: restored.source,
-            login: {
-              signInAttemptId: null,
-              sessionId: restored.sessionId,
-              clerkJwt: restored.clerkJwt,
-            },
-            userSession,
-          };
-        } catch {
-          throw this.buildMissingSessionError();
-        }
-      })().finally(() => {
+      this.authPromise = this.authenticate().finally(() => {
         this.authPromise = null;
       });
     }
     return await this.authPromise;
   }
 
+  async authenticate() {
+    // The proxy is long-lived, so once a session is in memory a Clerk touch is
+    // enough to mint the next short-lived JWT: no session file read, no bootstrap.
+    if (this.client.sessionId) {
+      try {
+        const clerkJwt = await this.client.refreshClerkJwt();
+        const userSession =
+          this.auth?.userSession ?? (await this.client.getUserSession(clerkJwt));
+        this.client.writeSavedSession({ lastValidatedAt: Date.now() });
+        return this.cacheAuth({
+          source: "refresh",
+          login: {
+            signInAttemptId: null,
+            sessionId: this.client.sessionId,
+            clerkJwt,
+          },
+          userSession,
+        });
+      } catch {
+        this.invalidateAuth();
+      }
+    }
+
+    const saved = this.client.readSavedSession();
+    if (!saved) {
+      throw this.buildMissingSessionError();
+    }
+
+    this.client.restoreSavedSession(saved);
+    if (this.client.hasUsableSavedJwt(saved)) {
+      try {
+        const userSession = await this.client.getUserSession(saved.clerkJwt);
+        this.client.writeSavedSession({ lastValidatedAt: Date.now() });
+        return this.cacheAuth({
+          source: "session",
+          login: {
+            signInAttemptId: null,
+            sessionId: this.client.sessionId,
+            clerkJwt: this.client.clerkJwt,
+          },
+          userSession,
+        });
+      } catch {
+        this.client.restoreSavedSession(saved);
+      }
+    }
+
+    try {
+      const restored = await this.client.restoreSessionFromCookies();
+      const userSession = await this.client.getUserSession(restored.clerkJwt);
+      this.client.writeSavedSession({
+        lastValidatedAt: Date.now(),
+        restoredAt: Date.now(),
+      });
+      return this.cacheAuth({
+        source: restored.source,
+        login: {
+          signInAttemptId: null,
+          sessionId: restored.sessionId,
+          clerkJwt: restored.clerkJwt,
+        },
+        userSession,
+      });
+    } catch {
+      throw this.buildMissingSessionError();
+    }
+  }
+
+  // Runs an upstream call with a cached JWT, retrying once on 401 in case the
+  // session was revoked or expired between the cache check and the request.
+  async callWithAuth(operation, { label, model }) {
+    let retriedUnauthorized = false;
+    return await retryModelOverloaded(
+      async (attempt) => {
+        const auth = await this.ensureAuth();
+        try {
+          return await operation(auth, attempt);
+        } catch (error) {
+          if (retriedUnauthorized || !isUnauthorizedError(error)) {
+            throw error;
+          }
+          retriedUnauthorized = true;
+          console.warn(
+            `[${nowIso()}] upstream rejected cached session; refreshing auth and retrying ${label}`,
+          );
+          this.invalidateAuth();
+          return await operation(await this.ensureAuth(), attempt);
+        }
+      },
+      { label, model },
+    );
+  }
+
   async getModels(options = {}) {
     const { onlyFree = false } = options || {};
-    const auth = await this.ensureAuth();
-    const models = await this.client.getTextModels(auth.login.clerkJwt, {
-      matureFilter: false,
-      onlySafeVenice: false,
-    });
+    const models = await this.callWithAuth(
+      async (auth) =>
+        await this.client.getTextModels(auth.login.clerkJwt, {
+          matureFilter: false,
+          onlySafeVenice: false,
+        }),
+      { label: "models", model: "n/a" },
+    );
     return models
       .filter(
         (model) =>
@@ -520,15 +596,14 @@ class VeniceOpenAiProxy {
   }
 
   async chatCompletions(payload) {
-    const auth = await this.ensureAuth();
     const { prompt, systemPrompt } = splitMessages(payload.messages);
     if (prompt.length === 0) {
       throw new Error("No usable prompt messages found.");
     }
 
     const model = payload.model || this.client.model;
-    return await retryModelOverloaded(
-      async () => {
+    return await this.callWithAuth(
+      async (auth) => {
         const requestId = Math.random().toString(36).slice(2, 9);
         return await this.client.chat(
           auth.login.clerkJwt,
@@ -541,15 +616,14 @@ class VeniceOpenAiProxy {
   }
 
   async openChatCompletionStream(payload) {
-    const auth = await this.ensureAuth();
     const { prompt, systemPrompt } = splitMessages(payload.messages);
     if (prompt.length === 0) {
       throw new Error("No usable prompt messages found.");
     }
 
     const model = payload.model || this.client.model;
-    return await retryModelOverloaded(
-      async () => {
+    return await this.callWithAuth(
+      async (auth) => {
         const requestId = Math.random().toString(36).slice(2, 9);
         return await this.client.openChatStream(
           auth.login.clerkJwt,

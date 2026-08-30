@@ -82,6 +82,34 @@ node .\venice-login.mjs
 
 This performs a fresh Clerk credential login without Chrome. It uses the npm package `wreq-js`, a native Node HTTP client with browser TLS/HTTP fingerprint profiles, so the network layer looks like Chrome to Clerk. It validates the Venice web session and writes `.venice-web-session.json` by default.
 
+#### Two-factor accounts
+
+If the account has two-factor auth enabled, Clerk answers the password step with
+`needs_second_factor` instead of creating a session. The login stops there, requests the
+code, and saves the pending sign-in attempt (plus its cookies) to
+`venice-2fa-first-step.json`, exiting with code `2`:
+
+```json
+{
+  "ok": false,
+  "status": "needs_second_factor",
+  "strategy": "email_code",
+  "stateFile": "venice-2fa-first-step.json",
+  "message": "Two-factor required. Venice sent a code to you@example.com. Re-run with --mfa-code <code>."
+}
+```
+
+Then finish the login with the emailed (or authenticator) code:
+
+```powershell
+node .\scripts\login.mjs --mfa-code 123456
+```
+
+`--mfa-code` with no value prompts for the code, and `VENICE_MFA_CODE` works too. On
+success the session file is written and the pending state file is deleted. Because the
+saved cookies mark the device as trusted, later logins usually skip the second factor.
+`VENICE_MFA_STATE_FILE` overrides the pending-state path.
+
 Optional modes:
 
 ```powershell
@@ -92,6 +120,16 @@ node .\venice-login.mjs --clean-session
 ```
 
 `--restore-only` refreshes from the saved session/cookies and never falls back to credential login. `--restore` keeps the older restore/direct fallback behavior for debugging. `--direct` uses the plain Node fetch implementation, which is useful for confirming Clerk bot/rate rejection but is not the normal login path. `--clean-session` removes saved Venice session files, including the configured `VENICE_SESSION_FILE` and the default `.venice-web-session.json`, without deleting `venice-login.json`.
+
+### Session caching
+
+The proxy is meant to stay up for days, so it keeps the authenticated session in memory. Clerk JWTs only live about a minute; when the cached one is within `VENICE_AUTH_REFRESH_SKEW_MS` (default 10000) of expiring, the proxy mints a new one with a single Clerk `touch` using the in-memory cookies, instead of re-reading the session file and re-running the sign-in bootstrap. Requests that arrive while a JWT is still fresh do no auth work at all.
+
+If an upstream call comes back `401` — a revoked or otherwise dead session — the cache is dropped and the request is retried once with a freshly minted JWT. Only if that refresh fails does the proxy fall back to the saved session file and cookie restore, and finally to asking you to run the login again.
+
+### HTTP transport
+
+Cloudflare rejects plain Node `fetch` on the Venice inference endpoints (`POST /api/inference/chat` returns a 403 challenge page), so the client sends every request through a `wreq-js` session with a Chrome TLS/HTTP fingerprint. Set `VENICE_HTTP_TRANSPORT=fetch` to force the old plain-fetch transport for debugging, and `VENICE_WREQ_BROWSER` / `VENICE_WREQ_OS` to change the impersonated profile (defaults: `chrome_131`, `macos`).
 
 You can also run the cleanup as:
 
