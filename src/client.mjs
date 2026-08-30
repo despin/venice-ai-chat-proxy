@@ -794,7 +794,7 @@ export class VeniceWebClient {
       includeVeniceSystemPrompt:
         typeof options.includeVeniceSystemPrompt === "boolean"
           ? options.includeVeniceSystemPrompt
-          : true,
+          : false,
       isCharacter: false,
       modelId: options.model || this.model,
       prompt: promptMessages,
@@ -857,7 +857,7 @@ export class VeniceWebClient {
       includeVeniceSystemPrompt:
         typeof options.includeVeniceSystemPrompt === "boolean"
           ? options.includeVeniceSystemPrompt
-          : true,
+          : false,
       isCharacter: false,
       modelId: options.model || this.model,
       prompt: promptMessages,

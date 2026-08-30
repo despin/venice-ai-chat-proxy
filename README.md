@@ -127,6 +127,18 @@ The proxy is meant to stay up for days, so it keeps the authenticated session in
 
 If an upstream call comes back `401` — a revoked or otherwise dead session — the cache is dropped and the request is retried once with a freshly minted JWT. Only if that refresh fails does the proxy fall back to the saved session file and cookie restore, and finally to asking you to run the login again.
 
+### Model sampling defaults
+
+Venice's web client sends a per-model `temperature` and `topP` with every message; the values live in the model catalog (`GET /api/app/encrypted_models`, inside the returned JWT as `text.models[].settings`). To keep proxy output reproducible against the web UI, the proxy loads that catalog at startup and caches the defaults, re-caching them whenever `/v1/models` is called.
+
+A request that sets `temperature` or `top_p` always wins; anything it omits falls back to the catalog value for that model. The translation log says which is which:
+
+```
+translate model="aion-labs-aion-3-0-mini" venice_model=aion-labs-aion-3-0-mini reasoning=true(model-default) venice_params={} temperature=0.6(catalog) top_p=0.9(catalog) messages=1
+```
+
+If the catalog can't be fetched at startup the proxy logs a warning and still serves; requests then fall back to Venice's own server-side defaults until the next `/v1/models` call.
+
 ### HTTP transport
 
 Cloudflare rejects plain Node `fetch` on the Venice inference endpoints (`POST /api/inference/chat` returns a 403 challenge page), so the client sends every request through a `wreq-js` session with a Chrome TLS/HTTP fingerprint. Set `VENICE_HTTP_TRANSPORT=fetch` to force the old plain-fetch transport for debugging, and `VENICE_WREQ_BROWSER` / `VENICE_WREQ_OS` to change the impersonated profile (defaults: `chrome_131`, `macos`).

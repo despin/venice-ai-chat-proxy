@@ -18,6 +18,9 @@ const DEBUG = Boolean(process.env.VENICE_DEBUG?.trim());
 // Clerk JWTs live about a minute; refresh a little before they lapse.
 const AUTH_REFRESH_SKEW_MS = Number(process.env.VENICE_AUTH_REFRESH_SKEW_MS || 10_000);
 const AGENTIC_MODEL_NAME = process.env.VENICE_AGENTIC_MODEL_NAME?.trim() || "agentic";
+// Venice's own system prompt is off unless a caller asks for it via the model
+// suffix; set explicitly so streaming and non-streaming paths never disagree.
+const DEFAULT_INCLUDE_VENICE_SYSTEM_PROMPT = false;
 const MODEL_SUFFIX_BOOLEAN_FIELDS = new Set([
   "includeVeniceSystemPrompt",
   "webEnabled",
@@ -448,27 +451,51 @@ function resolveReasoning(payload, model) {
   };
 }
 
+// Picks the sampling values Venice's own web client would send: an explicit
+// request value wins, otherwise the model catalog default keeps proxy output
+// reproducible against the web UI.
+function resolveSampling(payload, catalogSettings) {
+  const sampling = {};
+
+  if (typeof payload.temperature === "number") {
+    sampling.temperature = { value: payload.temperature, source: "request" };
+  } else if (typeof catalogSettings?.temperature === "number") {
+    sampling.temperature = { value: catalogSettings.temperature, source: "catalog" };
+  }
+
+  if (typeof payload.top_p === "number") {
+    sampling.topP = { value: payload.top_p, source: "request" };
+  } else if (typeof catalogSettings?.topP === "number") {
+    sampling.topP = { value: catalogSettings.topP, source: "catalog" };
+  }
+
+  return sampling;
+}
+
 function logRequestTranslation({
   requestedModel,
   options,
   features,
   reasoningSource,
   noThinkApplied,
+  sampling,
+  veniceSystemPromptSource,
 }) {
   const parts = [
     `model=${JSON.stringify(requestedModel ?? "")}`,
     `venice_model=${options.model}`,
     `reasoning=${options.reasoning}(${reasoningSource})`,
+    `venice_system_prompt=${options.includeVeniceSystemPrompt}(${veniceSystemPromptSource})`,
     `venice_params=${JSON.stringify(features)}`,
   ];
   if (noThinkApplied) {
     parts.push("no_think=true");
   }
   if (typeof options.temperature === "number") {
-    parts.push(`temperature=${options.temperature}`);
+    parts.push(`temperature=${options.temperature}(${sampling?.temperature?.source ?? "request"})`);
   }
   if (typeof options.topP === "number") {
-    parts.push(`top_p=${options.topP}`);
+    parts.push(`top_p=${options.topP}(${sampling?.topP?.source ?? "request"})`);
   }
   parts.push(`messages=${Array.isArray(options.promptMessages) ? options.promptMessages.length : 0}`);
   parts.push(`system_chars=${getTextLength(options.systemPrompt)}`);
@@ -479,7 +506,14 @@ function logRequestTranslation({
   console.log(`[${nowIso()}] translate ${parts.join(" ")}`);
 }
 
-function buildVeniceChatOptions({ payload, model, prompt, systemPrompt, requestId }) {
+function buildVeniceChatOptions({
+  payload,
+  model,
+  prompt,
+  systemPrompt,
+  requestId,
+  resolveModelSettings,
+}) {
   const parsedModel = parseModelFeatureSuffix(model);
   const { reasoning, source: reasoningSource } = resolveReasoning(payload, parsedModel.model);
   const promptMessages = reasoning ? prompt : appendNoThinkToLatestUserMessage(prompt);
@@ -501,11 +535,21 @@ function buildVeniceChatOptions({ payload, model, prompt, systemPrompt, requestI
     ...parsedModel.features,
   };
 
-  if (typeof payload.temperature === "number") {
-    options.temperature = payload.temperature;
+  const veniceSystemPromptFromSuffix =
+    typeof parsedModel.features.includeVeniceSystemPrompt === "boolean";
+  options.includeVeniceSystemPrompt = veniceSystemPromptFromSuffix
+    ? parsedModel.features.includeVeniceSystemPrompt
+    : DEFAULT_INCLUDE_VENICE_SYSTEM_PROMPT;
+
+  const sampling = resolveSampling(
+    payload,
+    resolveModelSettings?.(parsedModel.model) ?? null,
+  );
+  if (sampling.temperature) {
+    options.temperature = sampling.temperature.value;
   }
-  if (typeof payload.top_p === "number") {
-    options.topP = payload.top_p;
+  if (sampling.topP) {
+    options.topP = sampling.topP.value;
   }
 
   logRequestTranslation({
@@ -514,6 +558,8 @@ function buildVeniceChatOptions({ payload, model, prompt, systemPrompt, requestI
     features: parsedModel.features,
     reasoningSource,
     noThinkApplied,
+    sampling,
+    veniceSystemPromptSource: veniceSystemPromptFromSuffix ? "suffix" : "default",
   });
 
   return options;
@@ -526,6 +572,10 @@ class VeniceOpenAiProxy {
     this.authPromise = null;
     this.auth = null;
     this.authExpiresAt = 0;
+    // Per-model sampling defaults from Venice's encrypted model catalog, keyed
+    // by every id a caller might use (canonical, api, aliases).
+    this.modelSettings = new Map();
+    this.modelSettingsLoadedAt = 0;
   }
 
   buildMissingSessionError() {
@@ -656,8 +706,46 @@ class VeniceOpenAiProxy {
     );
   }
 
-  async getModels(options = {}) {
-    const { onlyFree = false } = options || {};
+  cacheModelSettings(models) {
+    const settings = new Map();
+    for (const model of Array.isArray(models) ? models : []) {
+      const entry = {};
+      if (typeof model?.settings?.temperature === "number") {
+        entry.temperature = model.settings.temperature;
+      }
+      if (typeof model?.settings?.topP === "number") {
+        entry.topP = model.settings.topP;
+      }
+      if (Object.keys(entry).length === 0) {
+        continue;
+      }
+      for (const id of [model.id, model.apiModelId, ...(model.aliasIds ?? [])]) {
+        if (typeof id === "string" && id) {
+          settings.set(id, entry);
+        }
+      }
+    }
+
+    // A catalog fetch that yields nothing usable keeps the previous defaults
+    // rather than silently reverting every model to Venice's server-side ones.
+    if (settings.size === 0) {
+      return this.modelSettings;
+    }
+
+    this.modelSettings = settings;
+    this.modelSettingsLoadedAt = Date.now();
+    debugLog("models:settings", { cached: settings.size });
+    return settings;
+  }
+
+  getModelSettings(model) {
+    if (typeof model !== "string" || !model) {
+      return null;
+    }
+    return this.modelSettings.get(model) ?? null;
+  }
+
+  async fetchTextModels() {
     const models = await this.callWithAuth(
       async (auth) =>
         await this.client.getTextModels(auth.login.clerkJwt, {
@@ -666,6 +754,21 @@ class VeniceOpenAiProxy {
         }),
       { label: "models", model: "n/a" },
     );
+    this.cacheModelSettings(models);
+    return models;
+  }
+
+  async refreshModelSettings() {
+    await this.fetchTextModels();
+    console.log(
+      `[${nowIso()}] model catalog loaded: ${this.modelSettings.size} sampling defaults cached`,
+    );
+    return this.modelSettings;
+  }
+
+  async getModels(options = {}) {
+    const { onlyFree = false } = options || {};
+    const models = await this.fetchTextModels();
     return models
       .filter(
         (model) =>
@@ -703,7 +806,14 @@ class VeniceOpenAiProxy {
         return await this.client.chat(
           auth.login.clerkJwt,
           undefined,
-          buildVeniceChatOptions({ payload, model, prompt, systemPrompt, requestId }),
+          buildVeniceChatOptions({
+            payload,
+            model,
+            prompt,
+            systemPrompt,
+            requestId,
+            resolveModelSettings: (id) => this.getModelSettings(id),
+          }),
         );
       },
       { label: "chat completion", model },
@@ -723,7 +833,14 @@ class VeniceOpenAiProxy {
         return await this.client.openChatStream(
           auth.login.clerkJwt,
           undefined,
-          buildVeniceChatOptions({ payload, model, prompt, systemPrompt, requestId }),
+          buildVeniceChatOptions({
+            payload,
+            model,
+            prompt,
+            systemPrompt,
+            requestId,
+            resolveModelSettings: (id) => this.getModelSettings(id),
+          }),
         );
       },
       { label: "chat completion stream", model },
@@ -1370,8 +1487,19 @@ export function startVeniceOpenAiProxyServer({
   const server = createVeniceOpenAiProxyServer(proxy);
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, host, () => {
+    server.listen(port, host, async () => {
       server.off("error", reject);
+      // Warm the sampling defaults so the first chat completion already matches
+      // the web UI; a failure here must not keep the proxy from serving.
+      try {
+        await proxy.refreshModelSettings();
+      } catch (error) {
+        console.warn(
+          `[${nowIso()}] could not load model catalog at startup: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
       resolve({ server, proxy, host, port });
     });
   });
