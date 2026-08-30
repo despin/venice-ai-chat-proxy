@@ -15,6 +15,12 @@ COPY scripts/ scripts/
 COPY check/models.mjs check/
 COPY index.mjs ./
 
+# The image has no .git, so /support/info reports the commit from build args.
+ARG VENICE_BUILD_COMMIT=""
+ARG VENICE_BUILD_BRANCH=""
+ENV VENICE_BUILD_COMMIT=$VENICE_BUILD_COMMIT
+ENV VENICE_BUILD_BRANCH=$VENICE_BUILD_BRANCH
+
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=3456

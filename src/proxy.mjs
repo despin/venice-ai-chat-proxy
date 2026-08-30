@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { VeniceWebClient, decodeJwtPayload } from "./client.mjs";
@@ -27,6 +28,88 @@ const MODEL_SUFFIX_BOOLEAN_FIELDS = new Set([
   "webScrapeEnabled",
   "xSearchEnabled",
 ]);
+
+const STARTED_AT = Date.now();
+const REPO_ROOT = new URL("../", import.meta.url);
+
+// Resolves the deployed commit without shelling out to git: reads the checkout
+// directly, and falls back to VENICE_BUILD_COMMIT for images built without .git.
+function readDeployedCommit() {
+  const envCommit = process.env.VENICE_BUILD_COMMIT?.trim();
+  if (envCommit) {
+    return {
+      commit: envCommit,
+      branch: process.env.VENICE_BUILD_BRANCH?.trim() || null,
+      source: "env",
+    };
+  }
+
+  try {
+    const head = fs.readFileSync(new URL(".git/HEAD", REPO_ROOT), "utf8").trim();
+
+    // Detached HEAD stores the sha itself instead of a ref.
+    if (/^[0-9a-f]{40}$/i.test(head)) {
+      return { commit: head, branch: null, source: "git" };
+    }
+
+    const ref = head.startsWith("ref: ") ? head.slice(5).trim() : null;
+    if (!ref) {
+      return { commit: null, branch: null, source: "unknown" };
+    }
+    const branch = ref.replace(/^refs\/heads\//, "");
+
+    try {
+      const commit = fs.readFileSync(new URL(`.git/${ref}`, REPO_ROOT), "utf8").trim();
+      return { commit, branch, source: "git" };
+    } catch {
+      // A packed checkout keeps refs in packed-refs rather than loose files.
+      const packed = fs.readFileSync(new URL(".git/packed-refs", REPO_ROOT), "utf8");
+      for (const line of packed.split("\n")) {
+        const [commit, name] = line.trim().split(/\s+/);
+        if (name === ref && /^[0-9a-f]{40}$/i.test(commit || "")) {
+          return { commit, branch, source: "git-packed" };
+        }
+      }
+      return { commit: null, branch, source: "unknown" };
+    }
+  } catch {
+    return { commit: null, branch: null, source: "unknown" };
+  }
+}
+
+function buildSupportInfo(proxy) {
+  const { commit, branch, source } = readDeployedCommit();
+  return {
+    ok: true,
+    service: "venice-openai-proxy",
+    build: {
+      commit,
+      commit_short: commit ? commit.slice(0, 7) : null,
+      branch,
+      source,
+    },
+    runtime: {
+      node: process.version,
+      pid: process.pid,
+      started_at: new Date(STARTED_AT).toISOString(),
+      uptime_seconds: Math.floor((Date.now() - STARTED_AT) / 1000),
+    },
+    session: {
+      session_file: proxy.client.sessionFile,
+      email: proxy.auth?.userSession?.email ?? proxy.client.email ?? null,
+      has_cached_auth: proxy.hasFreshAuth(),
+      auth_expires_at: proxy.authExpiresAt
+        ? new Date(proxy.authExpiresAt).toISOString()
+        : null,
+    },
+    models: {
+      sampling_defaults_cached: proxy.modelSettings.size,
+      loaded_at: proxy.modelSettingsLoadedAt
+        ? new Date(proxy.modelSettingsLoadedAt).toISOString()
+        : null,
+    },
+  };
+}
 
 function debugLog(label, data) {
   if (!DEBUG) return;
@@ -872,6 +955,21 @@ export function createVeniceOpenAiProxyServer(
           req,
           url,
           status: 204,
+          durationMs: Date.now() - startedAt,
+        });
+        return;
+      }
+
+      if (
+        req.method === "GET" &&
+        (url.pathname === "/support/info" || url.pathname === "/v1/support/info")
+      ) {
+        logIncomingRequest(req, url, 0);
+        json(res, 200, buildSupportInfo(proxy));
+        logOutgoingResponse({
+          req,
+          url,
+          status: 200,
           durationMs: Date.now() - startedAt,
         });
         return;

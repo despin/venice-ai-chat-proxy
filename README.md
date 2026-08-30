@@ -127,6 +127,33 @@ The proxy is meant to stay up for days, so it keeps the authenticated session in
 
 If an upstream call comes back `401` — a revoked or otherwise dead session — the cache is dropped and the request is retried once with a freshly minted JWT. Only if that refresh fails does the proxy fall back to the saved session file and cookie restore, and finally to asking you to run the login again.
 
+### Checking the deployed build
+
+`GET /support/info` (also `/v1/support/info`) reports which commit a running proxy is serving, so you don't have to infer it from behavior:
+
+```bash
+curl -s http://powerserver.local:3456/support/info
+```
+
+```json
+{
+  "ok": true,
+  "service": "venice-openai-proxy",
+  "build": { "commit": "e9f6594...", "commit_short": "e9f6594", "branch": "main", "source": "git" },
+  "runtime": { "node": "v25.9.0", "pid": 7112, "started_at": "...", "uptime_seconds": 24 },
+  "session": { "session_file": ".venice-web-session.json", "email": "you@example.com", "has_cached_auth": true, "auth_expires_at": "..." },
+  "models": { "sampling_defaults_cached": 261, "loaded_at": "..." }
+}
+```
+
+The commit is read straight from the checkout's `.git` (loose refs and `packed-refs` both work), with no `git` binary required. Docker images have no `.git`, so pass the commit at build time and `source` becomes `env`:
+
+```bash
+docker build --build-arg VENICE_BUILD_COMMIT=$(git rev-parse HEAD) --build-arg VENICE_BUILD_BRANCH=$(git rev-parse --abbrev-ref HEAD) -t venice-proxy .
+```
+
+The response includes the logged-in account's email, so keep the endpoint on a trusted network.
+
 ### Model sampling defaults
 
 Venice's web client sends a per-model `temperature` and `topP` with every message; the values live in the model catalog (`GET /api/app/encrypted_models`, inside the returned JWT as `text.models[].settings`). To keep proxy output reproducible against the web UI, the proxy loads that catalog at startup and caches the defaults, re-caching them whenever `/v1/models` is called.

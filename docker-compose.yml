@@ -1,6 +1,12 @@
 services:
   venice-openai-proxy:
-    build: .
+    build:
+      context: .
+      args:
+        # Written to .env by scripts/deploy.sh so /support/info reports the
+        # commit the image was built from.
+        VENICE_BUILD_COMMIT: "${VENICE_BUILD_COMMIT:-}"
+        VENICE_BUILD_BRANCH: "${VENICE_BUILD_BRANCH:-}"
     container_name: venice-openai-proxy
     ports:
       - "3456:3456"
