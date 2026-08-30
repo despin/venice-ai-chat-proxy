@@ -198,6 +198,12 @@ qwen3-4b:webEnabled=true&webScrapeEnabled=true
 qwen3-4b:webEnabled=true&xSearchEnabled=true
 ```
 
+For reasoning models, the proxy also recognizes OpenAI-style
+`reasoning_effort: "none"` on chat completion requests. It forwards
+`reasoning: false` to Venice and prefixes the latest user message with
+`/no_think `, matching Venice web behavior. Existing callers may also send
+`reasoning: false` directly.
+
 If Open WebUI runs in Docker and the proxy runs on the host, use:
 
 - `http://host.docker.internal:3456/v1`

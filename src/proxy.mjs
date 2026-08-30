@@ -267,6 +267,37 @@ function splitMessages(messages) {
   };
 }
 
+function appendNoThinkToLatestUserMessage(prompt) {
+  if (!Array.isArray(prompt)) {
+    return prompt;
+  }
+
+  const latestUserIndex = prompt.findLastIndex((message) => message?.role === "user");
+  if (latestUserIndex === -1) {
+    return prompt;
+  }
+
+  return prompt.map((message, index) => {
+    if (index !== latestUserIndex || typeof message?.content !== "string") {
+      return message;
+    }
+    if (message.content.startsWith("/no_think ")) {
+      return message;
+    }
+    return {
+      ...message,
+      content: `/no_think ${message.content}`,
+    };
+  });
+}
+
+function toChatCompletionId(id, created) {
+  if (typeof id !== "string" || !id) {
+    return `chatcmpl_${created}`;
+  }
+  return id.startsWith("chatcmpl") ? id : `chatcmpl_${id}`;
+}
+
 function buildChatCompletionResponse({
   requestModel,
   completionId,
@@ -400,17 +431,73 @@ function parseModelFeatureSuffix(model) {
     : { model, features: {} };
 }
 
+// Reports where the reasoning flag came from so the translation log can explain itself.
+function resolveReasoning(payload, model) {
+  if (typeof payload.reasoning === "boolean") {
+    return { reasoning: payload.reasoning, source: "reasoning" };
+  }
+
+  if (typeof payload.reasoning_effort === "string") {
+    const effort = payload.reasoning_effort.trim().toLowerCase();
+    return { reasoning: effort !== "none", source: `reasoning_effort=${effort}` };
+  }
+
+  return {
+    reasoning: !isTeeModel(model),
+    source: isTeeModel(model) ? "tee-model-default" : "model-default",
+  };
+}
+
+function logRequestTranslation({
+  requestedModel,
+  options,
+  features,
+  reasoningSource,
+  noThinkApplied,
+}) {
+  const parts = [
+    `model=${JSON.stringify(requestedModel ?? "")}`,
+    `venice_model=${options.model}`,
+    `reasoning=${options.reasoning}(${reasoningSource})`,
+    `venice_params=${JSON.stringify(features)}`,
+  ];
+  if (noThinkApplied) {
+    parts.push("no_think=true");
+  }
+  if (typeof options.temperature === "number") {
+    parts.push(`temperature=${options.temperature}`);
+  }
+  if (typeof options.topP === "number") {
+    parts.push(`top_p=${options.topP}`);
+  }
+  parts.push(`messages=${Array.isArray(options.promptMessages) ? options.promptMessages.length : 0}`);
+  parts.push(`system_chars=${getTextLength(options.systemPrompt)}`);
+  if (options.requestId) {
+    parts.push(`request_id=${options.requestId}`);
+  }
+
+  console.log(`[${nowIso()}] translate ${parts.join(" ")}`);
+}
+
 function buildVeniceChatOptions({ payload, model, prompt, systemPrompt, requestId }) {
   const parsedModel = parseModelFeatureSuffix(model);
+  const { reasoning, source: reasoningSource } = resolveReasoning(payload, parsedModel.model);
+  const promptMessages = reasoning ? prompt : appendNoThinkToLatestUserMessage(prompt);
+  // Only report the prefix when it actually reached the outgoing message.
+  const noThinkApplied = Array.isArray(promptMessages)
+    ? promptMessages.some(
+        (message) =>
+          message?.role === "user" &&
+          typeof message.content === "string" &&
+          message.content.startsWith("/no_think "),
+      )
+    : false;
   const options = {
     model: parsedModel.model,
-    promptMessages: prompt,
+    promptMessages,
     systemPrompt,
     requestId,
-    reasoning:
-      typeof payload.reasoning === "boolean"
-        ? payload.reasoning
-        : !isTeeModel(parsedModel.model),
+    reasoning,
     ...parsedModel.features,
   };
 
@@ -420,6 +507,14 @@ function buildVeniceChatOptions({ payload, model, prompt, systemPrompt, requestI
   if (typeof payload.top_p === "number") {
     options.topP = payload.top_p;
   }
+
+  logRequestTranslation({
+    requestedModel: model,
+    options,
+    features: parsedModel.features,
+    reasoningSource,
+    noThinkApplied,
+  });
 
   return options;
 }
@@ -1065,7 +1160,7 @@ export function createVeniceOpenAiProxyServer(
                 event?.kind === "meta" &&
                 typeof event.completion_id === "string"
               ) {
-                completionId = event.completion_id;
+                completionId = toChatCompletionId(event.completion_id, created);
               }
               if (
                 event?.kind === "meta" &&
@@ -1196,10 +1291,12 @@ export function createVeniceOpenAiProxyServer(
 
         const result = await proxy.chatCompletions(payload);
         const created = Math.floor(Date.now() / 1000);
-        const completionId =
+        const completionId = toChatCompletionId(
           result.events.find(
             (event) => event?.kind === "meta" && event?.completion_id,
-          )?.completion_id || `chatcmpl_${created}`;
+          )?.completion_id,
+          created,
+        );
         const servingModelId =
           result.events.find(
             (event) => event?.kind === "meta" && event?.servingModelId,
