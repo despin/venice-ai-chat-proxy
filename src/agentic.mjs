@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 
 const DEFAULT_AGENTIC_MODEL = "kimi-k2-5";
+// Models only the chat/agents/venice endpoint serves; requested by their own id.
+const DEFAULT_AGENT_ENDPOINT_MODELS = "deepseek-v4-1-flash-free";
 
 function safeJsonParse(text) {
   try {
@@ -126,7 +128,11 @@ export function convertToWorkflowMessages(openAiMessages) {
       if (embedded.length > 0) {
         result.push(...embedded);
       }
-      if (text) {
+      // The embedded history already ends with this turn's assistant message.
+      const embeddedHasMessage = embedded.some(
+        (item) => item?.type === "message" && item?.role === "assistant",
+      );
+      if (text && !embeddedHasMessage) {
         result.push({
           type: "message",
           role: "assistant",
@@ -158,12 +164,50 @@ export class AgenticProxy {
     return process.env.VENICE_AGENTIC_MODEL?.trim() || DEFAULT_AGENTIC_MODEL;
   }
 
+  agentEndpointModels() {
+    return (process.env.VENICE_AGENT_MODELS ?? DEFAULT_AGENT_ENDPOINT_MODELS)
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean);
+  }
+
+  // The workflow endpoint behind the "agentic" alias; also what /v1/responses
+  // uses for any model the agents endpoint does not claim.
+  workflowTarget() {
+    return { endpoint: "workflow", agentModelId: this.agentModelId() };
+  }
+
+  // Returns the agents-endpoint target for a model only that endpoint serves,
+  // or null when the model belongs elsewhere.
+  agentEndpointTarget(model) {
+    return this.agentEndpointModels().includes(model)
+      ? { endpoint: "agents", agentModelId: model }
+      : null;
+  }
+
+  openUpstream(jwt, messages, target = this.workflowTarget()) {
+    const options = { agentModelId: target.agentModelId };
+    return target.endpoint === "agents"
+      ? this.client.openAgentChatStream(jwt, messages, options)
+      : this.client.openWorkflowChatStream(jwt, messages, options);
+  }
+
   // Used by the /v1/responses handler — single-request, pass-through stream.
-  async openStream(jwt, input) {
+  async openStream(jwt, input, target) {
     const messages = Array.isArray(input)
       ? convertToWorkflowMessages(input)
       : convertToWorkflowMessages([{ role: "user", content: String(input) }]);
-    return this.client.openWorkflowChatStream(jwt, messages, { agentModelId: this.agentModelId() });
+    return this.openUpstream(jwt, messages, target);
+  }
+
+  // Opens the first upstream turn before returning the event stream, so a
+  // rejected request surfaces to the caller instead of as an empty stream.
+  async openSession(jwt, openAiMessages, target) {
+    const messages = Array.isArray(openAiMessages)
+      ? convertToWorkflowMessages(openAiMessages)
+      : convertToWorkflowMessages([{ role: "user", content: String(openAiMessages) }]);
+    const firstStream = await this.openUpstream(jwt, messages, target);
+    return this.agenticEventStream(jwt, messages, target, firstStream);
   }
 
   // Used by the agentic /v1/chat/completions handler.
@@ -174,17 +218,16 @@ export class AgenticProxy {
   // keeps the stream open — the loop only re-enters when the stream closes without
   // a completed status (e.g. a mid-search connection drop), reconstructing history
   // from the events already received so outerface can resume.
-  async *agenticEventStream(jwt, openAiMessages) {
+  async *agenticEventStream(jwt, workflowMessages, target, firstStream) {
     const MAX_TURNS = 20;
 
-    let messages = Array.isArray(openAiMessages)
-      ? convertToWorkflowMessages(openAiMessages)
-      : convertToWorkflowMessages([{ role: "user", content: String(openAiMessages) }]);
+    let messages = workflowMessages;
 
     for (let turn = 0; turn < MAX_TURNS; turn++) {
-      const stream = await this.client.openWorkflowChatStream(jwt, messages, {
-        agentModelId: this.agentModelId(),
-      });
+      const stream =
+        turn === 0 && firstStream
+          ? firstStream
+          : await this.openUpstream(jwt, messages, target);
 
       // Per-turn bookkeeping for history reconstruction if we need another turn.
       // output_index → raw item (from response.output_item.done)
@@ -266,6 +309,8 @@ function buildNextTurnItems(outputItems, itemTexts) {
       result.push({
         type: "reasoning",
         id: item.id,
+        // The agents endpoint tags reasoning with the model that produced it.
+        ...(item.model_id ? { model_id: item.model_id } : {}),
         status: "completed",
         summary: text ? [{ type: "summary_text", text }] : [],
       });

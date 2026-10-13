@@ -412,6 +412,110 @@ function writeSseChunk(res, data) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
+// Rewrites outerface agent events into OpenAI Responses events. Outerface
+// streams reasoning as output_text on a reasoning item; Responses clients expect
+// a reasoning summary, kept apart from the answer text.
+function createResponsesTranslator({ model, created }) {
+  const items = new Map(); // output_index -> { type, text }
+  const output = [];
+  let response = {
+    id: `resp_${created}`,
+    object: "response",
+    created_at: created,
+    status: "in_progress",
+    model,
+  };
+
+  return {
+    snapshot() {
+      return { ...response, output };
+    },
+
+    translate({ event, data }) {
+      if (
+        event === "response.created" ||
+        event === "response.in_progress" ||
+        event === "response.completed"
+      ) {
+        response = { ...response, ...data?.response, model };
+        const completed = event === "response.completed";
+        return [{ event, data: { ...data, response: { ...response, output: completed ? output : [] } } }];
+      }
+
+      if (event === "response.output_item.added") {
+        const item = data?.item ?? {};
+        items.set(data?.output_index, { type: item.type, text: "" });
+        return [
+          {
+            event,
+            data: item.type === "reasoning" ? { ...data, item: { ...item, summary: [] } } : data,
+          },
+        ];
+      }
+
+      const tracked = items.get(data?.output_index);
+      const isReasoning = tracked?.type === "reasoning";
+
+      if (event === "response.output_text.delta" || event === "response.output_text.done") {
+        const done = event === "response.output_text.done";
+        if (tracked && done && typeof data?.text === "string") {
+          tracked.text = data.text;
+        } else if (tracked && !done && typeof data?.delta === "string") {
+          tracked.text += data.delta;
+        }
+        if (!isReasoning) {
+          return [{ event, data }];
+        }
+        const { content_index: _contentIndex, ...rest } = data;
+        return [
+          {
+            event: `response.reasoning_summary_text.${done ? "done" : "delta"}`,
+            data: { ...rest, summary_index: 0 },
+          },
+        ];
+      }
+
+      if (event === "response.content_part.added" || event === "response.content_part.done") {
+        if (!isReasoning) {
+          return [{ event, data }];
+        }
+        const done = event === "response.content_part.done";
+        const { content_index: _contentIndex, part: _part, ...rest } = data;
+        return [
+          {
+            event: `response.reasoning_summary_part.${done ? "done" : "added"}`,
+            data: {
+              ...rest,
+              summary_index: 0,
+              part: { type: "summary_text", text: done ? tracked.text : "" },
+            },
+          },
+        ];
+      }
+
+      if (event === "response.output_item.done") {
+        let item = data?.item ?? {};
+        if (item.type === "reasoning") {
+          item = { ...item, summary: [{ type: "summary_text", text: tracked?.text ?? "" }] };
+          output.push(item);
+        } else if (item.type === "message") {
+          // workflow/chat leaves the finished item's content empty; the text
+          // only arrives through the output_text events.
+          const content =
+            Array.isArray(item.content) && item.content.length > 0
+              ? item.content
+              : [{ type: "output_text", text: tracked?.text ?? "" }];
+          item = { ...item, content: content.map((part) => ({ annotations: [], ...part })) };
+          output.push(item);
+        }
+        return [{ event, data: { ...data, item } }];
+      }
+
+      return [];
+    },
+  };
+}
+
 function createStreamStats() {
   return {
     contentLength: 0,
@@ -852,7 +956,7 @@ class VeniceOpenAiProxy {
   async getModels(options = {}) {
     const { onlyFree = false } = options || {};
     const models = await this.fetchTextModels();
-    return models
+    const data = models
       .filter(
         (model) =>
           model &&
@@ -874,6 +978,24 @@ class VeniceOpenAiProxy {
           model_traits: model.apiModelTraits || [],
         },
       }));
+
+    // Agent-endpoint models are missing from the catalog, so list them by hand.
+    for (const id of this.agentic.agentEndpointModels()) {
+      if (data.some((model) => model.id === id)) {
+        continue;
+      }
+      data.push({
+        id,
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: "venice-web",
+        permission: [],
+        root: id,
+        parent: null,
+        venice: { id, friendly_name: id, model_traits: [] },
+      });
+    }
+    return data;
   }
 
   async chatCompletions(payload) {
@@ -1009,12 +1131,27 @@ export function createVeniceOpenAiProxyServer(
           return;
         }
 
-        const auth = await proxy.ensureAuth();
-        const agentModelId = proxy.agentic.agentModelId();
-        const stream = await proxy.agentic.openStream(auth.login.clerkJwt, payload.input);
+        // Models only the agents endpoint serves go there; everything else keeps
+        // using the workflow endpoint, as before.
+        const target =
+          proxy.agentic.agentEndpointTarget(payload.model) ?? proxy.agentic.workflowTarget();
+        const agentModelId = target.agentModelId;
+        const stream = await proxy.callWithAuth(
+          async (auth) =>
+            await proxy.agentic.openStream(auth.login.clerkJwt, payload.input, target),
+          { label: "responses", model: agentModelId },
+        );
         const created = Math.floor(Date.now() / 1000);
-        let responseId = `resp_${created}`;
+        const translator = createResponsesTranslator({ model: agentModelId, created });
         let contentLength = 0;
+        let reasoningLength = 0;
+        const countDelta = (out) => {
+          if (out.event === "response.output_text.delta") {
+            contentLength += getTextLength(out.data?.delta);
+          } else if (out.event === "response.reasoning_summary_text.delta") {
+            reasoningLength += getTextLength(out.data?.delta);
+          }
+        };
 
         if (payload.stream) {
           res.writeHead(200, {
@@ -1025,82 +1162,58 @@ export function createVeniceOpenAiProxyServer(
 
           try {
             for await (const sseEvent of stream.events) {
-              const { event, data } = sseEvent;
               debugLog("workflow:event", sseEvent);
-
-              if (event === "response.created" || event === "response.in_progress") {
-                if (data?.response?.id) responseId = data.response.id;
-                debugLog("responses:forward", event);
-                res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-                continue;
+              const translated = translator.translate(sseEvent);
+              if (translated.length === 0) {
+                debugLog("responses:forward", "[skip]");
               }
-
-              if (event === "response.output_text.delta") {
-                contentLength += getTextLength(data?.delta);
-                debugLog("responses:forward", event);
-                res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-                continue;
+              for (const out of translated) {
+                countDelta(out);
+                debugLog("responses:forward", out.event);
+                // OpenAI clients read the event name from the payload's `type`,
+                // which outerface only sends on the SSE `event:` line.
+                res.write(
+                  `event: ${out.event}\ndata: ${JSON.stringify({ type: out.event, ...out.data })}\n\n`,
+                );
               }
-
-              if (
-                event === "response.completed" ||
-                event === "response.output_item.done" ||
-                event === "response.content_part.done" ||
-                event === "response.output_item.added" ||
-                event === "response.content_part.added"
-              ) {
-                debugLog("responses:forward", event);
-                res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-                continue;
-              }
-
-              debugLog("responses:forward", "[skip]");
             }
 
             res.write("data: [DONE]\n\n");
             res.end();
-            logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength, durationMs: Date.now() - startedAt });
           } catch (error) {
+            console.warn(
+              `[${nowIso()}] responses stream failed model=${agentModelId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
             if (!res.writableEnded) res.end();
-            logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength, durationMs: Date.now() - startedAt });
           }
+          logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength, reasoningLength, durationMs: Date.now() - startedAt });
           return;
         }
 
-        // Non-streaming: collect all text deltas
-        let fullText = "";
+        // Non-streaming: fold the stream into a single response object.
         try {
           for await (const sseEvent of stream.events) {
-            const { event, data } = sseEvent;
             debugLog("workflow:event", sseEvent);
-            if (event === "response.created" && data?.response?.id) {
-              responseId = data.response.id;
-            }
-            if (event === "response.output_text.delta" && typeof data?.delta === "string") {
-              fullText += data.delta;
-            }
+            translator.translate(sseEvent).forEach(countDelta);
           }
-        } catch {
-          // partial result is fine
+        } catch (error) {
+          // A partial result is still returned, but nothing at all is an error.
+          if (translator.snapshot().output.length === 0) throw error;
+          console.warn(
+            `[${nowIso()}] responses stream failed model=${agentModelId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
         }
 
-        const outputId = `msg_${created}`;
-        json(res, 200, {
-          id: responseId,
-          object: "response",
-          created_at: created,
-          model: agentModelId,
-          output: [
-            {
-              type: "message",
-              id: outputId,
-              role: "assistant",
-              status: "completed",
-              content: [{ type: "output_text", text: fullText, annotations: [] }],
-            },
-          ],
-        });
-        logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength: fullText.length, durationMs: Date.now() - startedAt });
+        const response = translator.snapshot();
+        if (response.status !== "completed") {
+          response.status = "incomplete";
+        }
+        json(res, 200, response);
+        logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength, reasoningLength, durationMs: Date.now() - startedAt });
         return;
       }
 
@@ -1143,15 +1256,23 @@ export function createVeniceOpenAiProxyServer(
           return;
         }
 
-        // ── Agentic branch: route to workflow/chat when model === AGENTIC_MODEL_NAME ──
-        if (payload.model === AGENTIC_MODEL_NAME) {
-          const auth = await proxy.ensureAuth();
-          const agentModelId = proxy.agentic.agentModelId();
-          // agenticEventStream drives the full session: it keeps the outerface
-          // connection open until response.completed status=completed, and
-          // automatically re-enters with reconstructed history if the stream
-          // closes prematurely (e.g. a connection drop mid-tool-call).
-          const agentEvents = proxy.agentic.agenticEventStream(auth.login.clerkJwt, payload.messages);
+        // ── Agentic branch: workflow/chat when model === AGENTIC_MODEL_NAME, and
+        // chat/agents/venice for the models only that endpoint serves ──
+        const agentTarget =
+          payload.model === AGENTIC_MODEL_NAME
+            ? proxy.agentic.workflowTarget()
+            : proxy.agentic.agentEndpointTarget(payload.model);
+        if (agentTarget) {
+          const agentModelId = agentTarget.agentModelId;
+          // The session keeps the outerface connection open until
+          // response.completed status=completed, and automatically re-enters
+          // with reconstructed history if the stream closes prematurely (e.g. a
+          // connection drop mid-tool-call).
+          const agentEvents = await proxy.callWithAuth(
+            async (auth) =>
+              await proxy.agentic.openSession(auth.login.clerkJwt, payload.messages, agentTarget),
+            { label: "agent chat completion", model: agentModelId },
+          );
           const created = Math.floor(Date.now() / 1000);
           let completionId = `chatcmpl_${created}`;
           // Track which output_index holds reasoning vs message content
@@ -1294,6 +1415,11 @@ export function createVeniceOpenAiProxyServer(
               logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength, reasoningLength, durationMs: Date.now() - startedAt, streamDurationMs: Date.now() - streamStartedAt });
             } catch (error) {
               if (!res.headersSent) throw error;
+              console.warn(
+                `[${nowIso()}] agent stream failed model=${agentModelId}: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
               res.end();
               logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength, reasoningLength, durationMs: Date.now() - startedAt, streamDurationMs: Date.now() - streamStartedAt });
             }
@@ -1333,8 +1459,13 @@ export function createVeniceOpenAiProxyServer(
                 }
               }
             }
-          } catch {
+          } catch (error) {
             // partial result is fine
+            console.warn(
+              `[${nowIso()}] agent stream failed model=${agentModelId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
           }
 
           const message = { role: "assistant", content: fullContent };

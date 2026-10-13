@@ -933,6 +933,46 @@ export class VeniceWebClient {
     };
   }
 
+  // The agents endpoint speaks the same item format and SSE events as
+  // workflow/chat, and is the only route to models such as
+  // deepseek-v4-1-flash-free that the plain chat endpoint does not serve.
+  async openAgentChatStream(jwt, messages, options = {}) {
+    const agentModelId = options.agentModelId || "deepseek-v4-1-flash-free";
+    const requestBody = {
+      clientTools: Array.isArray(options.clientTools) ? options.clientTools : [],
+      input: { messages },
+    };
+    debugLog("outerface:req", {
+      method: "POST",
+      path: `/api/inference/chat/agents/venice?agentModelId=${agentModelId}`,
+      body: requestBody,
+    });
+    const response = await this.request(
+      `${OUTFACE_BASE_URL}/api/inference/chat/agents/venice?agentModelId=${encodeURIComponent(agentModelId)}`,
+      {
+        method: "POST",
+        headers: {
+          ...this.outerfaceHeaders(jwt, {
+            accept: "text/event-stream",
+            "content-type": "application/json",
+            "x-venice-middleface-version": this.middlefaceVersion,
+          }),
+        },
+        body: JSON.stringify(requestBody),
+      },
+    );
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`HTTP ${response.status}: ${text}`);
+    }
+
+    return {
+      response,
+      events: parseSseStream(response.body),
+    };
+  }
+
   async login() {
     if (!this.email) {
       this.email = requiredCredential("VENICE_EMAIL");

@@ -6,6 +6,7 @@ It currently provides:
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 - streaming chat completions
 - session restore using the saved Venice web session file
 - request/response logging for incoming requests and streamed output sizes
@@ -242,6 +243,31 @@ For reasoning models, the proxy also recognizes OpenAI-style
 `reasoning: false` to Venice and prefixes the latest user message with
 `/no_think `, matching Venice web behavior. Existing callers may also send
 `reasoning: false` directly.
+
+### Agent endpoint models
+
+Some models are only served by Venice's agents endpoint
+(`POST /api/inference/chat/agents/venice?agentModelId=<id>`): they are missing from the
+model catalog and the plain chat endpoint does not accept them. `deepseek-v4-1-flash-free`
+is one. The proxy appends these to `/v1/models` and routes them by their own id on both
+`/v1/chat/completions` and `/v1/responses`, streaming or not:
+
+```bash
+curl -s http://127.0.0.1:3456/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"deepseek-v4-1-flash-free","messages":[{"role":"user","content":"hi"}]}'
+```
+
+`VENICE_AGENT_MODELS` is a comma-separated list of the ids to route this way (default
+`deepseek-v4-1-flash-free`). Venice decides what actually answers: on a free account a
+request for `zai-org-glm-5-2` through this endpoint was still served by
+`deepseek-v4-1-flash-free`. The endpoint takes no sampling parameters, system prompt
+field, or model feature suffix: `temperature`/`top_p` are ignored, and system messages
+are sent as a leading `[System]` user message. OpenAI `tools` are not forwarded.
+
+On `/v1/responses`, any other model keeps going to the older workflow endpoint with
+`VENICE_AGENTIC_MODEL`. Reasoning is returned as a `reasoning` item with a summary
+(`response.reasoning_summary_text.*` events when streaming), separate from the answer.
 
 If Open WebUI runs in Docker and the proxy runs on the host, use:
 
