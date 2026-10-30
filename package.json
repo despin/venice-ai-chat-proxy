@@ -3,6 +3,8 @@
     "check:concurrency": "node ./check/concurrency.mjs",
     "check:models": "node ./check/models.mjs",
     "check:openai-client": "node ./check/openai.mjs",
+    "check:tool-emulation": "node ./check/tool-emulation.mjs",
+    "check:tools": "node ./check/tools.mjs",
     "clean-session": "node ./scripts/login.mjs --clean-session",
     "convert:chat": "node ./scripts/convert.mjs",
     "login": "node ./scripts/login.mjs",
