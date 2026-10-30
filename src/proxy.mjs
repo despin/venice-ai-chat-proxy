@@ -3,6 +3,14 @@ import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { VeniceWebClient, decodeJwtPayload } from "./client.mjs";
 import { AgenticProxy } from "./agentic.mjs";
+import { normalizeOpenAiContent } from "./openai-content.mjs";
+import {
+  buildToolCallDeltas,
+  parseToolEmulationSetting,
+  resolveToolEmulation,
+  runToolEmulation,
+  truncateSnippet,
+} from "./tool-emulation.mjs";
 
 const PORT = Number(process.env.PORT || process.env.VENICE_PROXY_PORT || 3456);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -19,6 +27,11 @@ const DEBUG = Boolean(process.env.VENICE_DEBUG?.trim());
 // Clerk JWTs live about a minute; refresh a little before they lapse.
 const AUTH_REFRESH_SKEW_MS = Number(process.env.VENICE_AUTH_REFRESH_SKEW_MS || 10_000);
 const AGENTIC_MODEL_NAME = process.env.VENICE_AGENTIC_MODEL_NAME?.trim() || "agentic";
+// Prompt-based tool calling for requests that send `tools`; "off" restores the
+// old behavior of ignoring them.
+const TOOL_EMULATION_ENABLED = parseToolEmulationSetting(process.env.VENICE_TOOL_EMULATION);
+// Forced off (with includeVeniceSystemPrompt) whenever tools are emulated.
+const TOOL_EMULATION_DISABLED_FEATURES = ["webEnabled", "webScrapeEnabled", "xSearchEnabled"];
 // Venice's own system prompt is off unless a caller asks for it via the model
 // suffix; set explicitly so streaming and non-streaming paths never disagree.
 const DEFAULT_INCLUDE_VENICE_SYSTEM_PROMPT = false;
@@ -195,15 +208,34 @@ function logOutgoingResponse({
   reasoningLength = 0,
   durationMs,
   streamDurationMs = null,
+  toolCount = null,
+  toolCallCount = 0,
 }) {
   const streamPart =
     typeof streamDurationMs === "number"
       ? ` stream_ms=${streamDurationMs}`
       : "";
   const modelPart = model ? ` model=${model}` : "";
+  // Only requests that went through tool emulation report tool counts.
+  const toolsPart =
+    typeof toolCount === "number" ? ` tools=${toolCount} tool_calls=${toolCallCount}` : "";
   console.log(
-    `[${nowIso()}] outgoing ${req.method} ${url.pathname} status=${status}${modelPart} content_chars=${contentLength} reasoning_chars=${reasoningLength} duration_ms=${durationMs}${streamPart}`,
+    `[${nowIso()}] outgoing ${req.method} ${url.pathname} status=${status}${modelPart} content_chars=${contentLength} reasoning_chars=${reasoningLength}${toolsPart} duration_ms=${durationMs}${streamPart}`,
   );
+}
+
+const TOOL_LOG_OUTPUT_MAX_CHARS = 4000;
+
+// Logs what runToolEmulation reports, raw model outputs included (truncated).
+function logToolEmulationEvent({ type, reason, outputs }, model) {
+  const message =
+    type === "unparsed"
+      ? "unparsed tool call; returning the text as content"
+      : "ignoring an unparsed call after a valid one";
+  const outputPart = outputs
+    .map((output, index) => ` output${index + 1}=${JSON.stringify(truncateSnippet(output, TOOL_LOG_OUTPUT_MAX_CHARS))}`)
+    .join("");
+  console.warn(`[${nowIso()}] tool emulation: ${message} (${reason}) model=${model}${outputPart}`);
 }
 
 function json(res, status, body) {
@@ -298,30 +330,6 @@ async function retryModelOverloaded(operation, { label, model }) {
   }
 }
 
-function normalizeOpenAiContent(content) {
-  if (typeof content === "string") {
-    return content;
-  }
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === "string") {
-          return part;
-        }
-        if (part?.type === "text" && typeof part.text === "string") {
-          return part.text;
-        }
-        if (part?.type === "input_text" && typeof part.text === "string") {
-          return part.text;
-        }
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n");
-  }
-  return "";
-}
-
 function splitMessages(messages) {
   const prompt = [];
   const systemParts = [];
@@ -389,7 +397,15 @@ function buildChatCompletionResponse({
   completionId,
   text,
   created,
+  toolCalls = [],
 }) {
+  const message = {
+    role: "assistant",
+    content: text,
+  };
+  if (toolCalls.length > 0) {
+    message.tool_calls = toolCalls;
+  }
   return {
     id: completionId || `chatcmpl_${created}`,
     object: "chat.completion",
@@ -398,11 +414,8 @@ function buildChatCompletionResponse({
     choices: [
       {
         index: 0,
-        finish_reason: "stop",
-        message: {
-          role: "assistant",
-          content: text,
-        },
+        finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
+        message,
       },
     ],
   };
@@ -667,6 +680,8 @@ function logRequestTranslation({
   noThinkApplied,
   sampling,
   veniceSystemPromptSource,
+  toolEmulation = null,
+  toolOverrides = [],
 }) {
   const parts = [
     `model=${JSON.stringify(requestedModel ?? "")}`,
@@ -684,6 +699,13 @@ function logRequestTranslation({
   if (typeof options.topP === "number") {
     parts.push(`top_p=${options.topP}(${sampling?.topP?.source ?? "request"})`);
   }
+  if (toolEmulation) {
+    parts.push(`tools=${toolEmulation.tools.length}`);
+    parts.push(`tool_choice=${toolEmulation.toolChoiceLabel}`);
+    if (toolOverrides.length > 0) {
+      parts.push(`disabled_for_tools=${toolOverrides.join(",")}`);
+    }
+  }
   parts.push(`messages=${Array.isArray(options.promptMessages) ? options.promptMessages.length : 0}`);
   parts.push(`system_chars=${getTextLength(options.systemPrompt)}`);
   if (options.requestId) {
@@ -700,6 +722,7 @@ function buildVeniceChatOptions({
   systemPrompt,
   requestId,
   resolveModelSettings,
+  toolEmulation = null,
 }) {
   const parsedModel = parseModelFeatureSuffix(model);
   const { reasoning, source: reasoningSource } = resolveReasoning(payload, parsedModel.model);
@@ -727,6 +750,24 @@ function buildVeniceChatOptions({
   options.includeVeniceSystemPrompt = veniceSystemPromptFromSuffix
     ? parsedModel.features.includeVeniceSystemPrompt
     : DEFAULT_INCLUDE_VENICE_SYSTEM_PROMPT;
+  let veniceSystemPromptSource = veniceSystemPromptFromSuffix ? "suffix" : "default";
+
+  // Venice's own system prompt and server-side search compete with the tool
+  // instructions, so emulated requests always go without them.
+  const toolOverrides = [];
+  if (toolEmulation) {
+    for (const name of TOOL_EMULATION_DISABLED_FEATURES) {
+      if (options[name]) {
+        toolOverrides.push(name);
+      }
+      options[name] = false;
+    }
+    if (options.includeVeniceSystemPrompt) {
+      toolOverrides.push("includeVeniceSystemPrompt");
+    }
+    options.includeVeniceSystemPrompt = false;
+    veniceSystemPromptSource = "tools";
+  }
 
   const sampling = resolveSampling(
     payload,
@@ -746,7 +787,9 @@ function buildVeniceChatOptions({
     reasoningSource,
     noThinkApplied,
     sampling,
-    veniceSystemPromptSource: veniceSystemPromptFromSuffix ? "suffix" : "default",
+    veniceSystemPromptSource,
+    toolEmulation,
+    toolOverrides,
   });
 
   return options;
@@ -1025,8 +1068,8 @@ class VeniceOpenAiProxy {
     );
   }
 
-  async openChatCompletionStream(payload) {
-    const { prompt, systemPrompt } = splitMessages(payload.messages);
+  async openChatCompletionStream(payload, toolEmulation = null) {
+    const { prompt, systemPrompt } = splitMessages(toolEmulation?.messages ?? payload.messages);
     if (prompt.length === 0) {
       throw new Error("No usable prompt messages found.");
     }
@@ -1045,6 +1088,7 @@ class VeniceOpenAiProxy {
             systemPrompt,
             requestId,
             resolveModelSettings: (id) => this.getModelSettings(id),
+            toolEmulation,
           }),
         );
       },
@@ -1055,6 +1099,213 @@ class VeniceOpenAiProxy {
 
 export function createVeniceOpenAiProxy() {
   return new VeniceOpenAiProxy();
+}
+
+// Normalized upstream events for one emulated attempt on the chat endpoint.
+async function* chatAttemptEvents(proxy, payload, toolEmulation, messages, stats) {
+  const created = Math.floor(Date.now() / 1000);
+  const stream = await proxy.openChatCompletionStream(payload, { ...toolEmulation, messages });
+  // What the proxy drops on the floor: other event kinds, non-JSON lines, and
+  // unexpected fields on content events. Logged once, so a model whose tool
+  // calls never show up as content can be diagnosed without a full dump.
+  const ignored = new Map();
+  const noteIgnored = (label) => ignored.set(label, (ignored.get(label) ?? 0) + 1);
+  try {
+    for await (const event of stream.events) {
+      if (event?.kind !== "meta" && event?.kind !== "content") {
+        noteIgnored(typeof event === "object" && event !== null ? `kind:${event.kind}` : `non-json:${JSON.stringify(String(event).slice(0, 40))}`);
+      } else if (event.kind === "content") {
+        for (const key of Object.keys(event)) {
+          if (!["kind", "content", "reasoning_content"].includes(key)) {
+            noteIgnored(`content.${key}`);
+          }
+        }
+      }
+      yield* normalizeChatEvent(event, stats, created);
+    }
+  } finally {
+    if (ignored.size > 0) {
+      console.warn(
+        `[${nowIso()}] tool emulation: ignored upstream events model=${payload.model} ${[...ignored]
+          .map(([label, count]) => `${label}×${count}`)
+          .join(" ")}`,
+      );
+    }
+  }
+}
+
+// One upstream chat event as runToolEmulation events.
+function* normalizeChatEvent(event, stats, created) {
+  updateStreamStats(stats, event);
+  debugLog("venice:event", event);
+  if (event?.kind === "meta") {
+    yield {
+      type: "meta",
+      completionId:
+        typeof event.completion_id === "string" ? toChatCompletionId(event.completion_id, created) : undefined,
+      model: typeof event.servingModelId === "string" ? event.servingModelId : undefined,
+    };
+    return;
+  }
+  if (event?.kind !== "content") {
+    return;
+  }
+  if (typeof event.reasoning_content === "string" && event.reasoning_content !== "") {
+    yield { type: "reasoning", text: event.reasoning_content };
+  }
+  if (typeof event.content === "string" && event.content !== "") {
+    yield { type: "content", text: event.content };
+  }
+}
+
+// /v1/chat/completions for a request with tools, streaming or not. Both modes
+// read the upstream as a stream so a finished reply can cut it short and an
+// unparsed call can be retried before anything about it is sent.
+async function respondWithToolEmulation({ req, res, url, startedAt, proxy, payload, toolEmulation }) {
+  const created = Math.floor(Date.now() / 1000);
+  let completionId = `chatcmpl_${created}`;
+  let model = payload.model || proxy.client.model;
+  const stats = createStreamStats();
+  const runStats = {};
+  const events = runToolEmulation({
+    emulation: toolEmulation,
+    openAttempt: (messages) => chatAttemptEvents(proxy, payload, toolEmulation, messages, stats),
+    onEvent: (event) => logToolEmulationEvent(event, model),
+    stats: runStats,
+  });
+  const logDone = (streamStartedAt = null) =>
+    logOutgoingResponse({
+      req,
+      url,
+      status: 200,
+      model,
+      contentLength: stats.contentLength,
+      reasoningLength: stats.reasoningLength,
+      toolCount: toolEmulation.tools.length,
+      toolCallCount: runStats.toolCalls ?? 0,
+      durationMs: Date.now() - startedAt,
+      streamDurationMs: streamStartedAt === null ? null : Date.now() - streamStartedAt,
+    });
+  const applyMeta = (event) => {
+    completionId = event.completionId ?? completionId;
+    model = event.model ?? model;
+  };
+
+  if (!payload.stream) {
+    let text = "";
+    let reasoning = "";
+    const toolCalls = [];
+    for await (const event of events) {
+      if (event.type === "meta") {
+        applyMeta(event);
+      } else if (event.type === "reasoning") {
+        reasoning += event.text;
+      } else if (event.type === "text") {
+        text += event.text;
+      } else if (event.type === "tool_call") {
+        toolCalls.push(event.toolCall);
+      }
+    }
+    const response = buildChatCompletionResponse({
+      requestModel: model,
+      completionId,
+      text: toolCalls.length > 0 ? text.trim() || null : text,
+      created,
+      toolCalls,
+    });
+    if (reasoning) {
+      response.choices[0].message.reasoning_content = reasoning;
+    }
+    json(res, 200, response);
+    logDone();
+    return;
+  }
+
+  const streamStartedAt = Date.now();
+  let firstDeltaSent = false;
+  let toolCallIndex = 0;
+  // Headers go out with the first chunk, so a failure to open the upstream
+  // still becomes a JSON error.
+  const writeDelta = (delta) => {
+    if (!res.headersSent) {
+      res.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+    }
+    const chunk = {
+      id: completionId,
+      object: "chat.completion.chunk",
+      created,
+      model,
+      choices: [
+        {
+          index: 0,
+          delta: firstDeltaSent ? delta : { role: "assistant", ...delta },
+          finish_reason: null,
+          logprobs: null,
+        },
+      ],
+      usage: null,
+    };
+    firstDeltaSent = true;
+    debugLog("openai:chunk", chunk);
+    writeSseChunk(res, chunk);
+  };
+
+  try {
+    for await (const event of events) {
+      if (event.type === "meta") {
+        if (!firstDeltaSent) {
+          applyMeta(event);
+        }
+      } else if (event.type === "reasoning") {
+        writeDelta({ content: null, reasoning_content: event.text });
+      } else if (event.type === "text") {
+        writeDelta({ content: event.text, reasoning_content: null });
+      } else if (event.type === "tool_call") {
+        for (const delta of buildToolCallDeltas(event.toolCall, toolCallIndex)) {
+          writeDelta(delta);
+        }
+        toolCallIndex += 1;
+      }
+    }
+
+    if (!firstDeltaSent) {
+      writeDelta({ content: null, reasoning_content: null });
+    }
+    const finishChunk = {
+      id: completionId,
+      object: "chat.completion.chunk",
+      created,
+      model,
+      choices: [
+        {
+          index: 0,
+          delta: { content: "", reasoning_content: null },
+          finish_reason: toolCallIndex > 0 ? "tool_calls" : "stop",
+          logprobs: null,
+        },
+      ],
+      usage: null,
+    };
+    writeSseChunk(res, finishChunk);
+    writeSseChunk(res, { id: completionId, object: "chat.completion.chunk", created, model, choices: [], usage: null });
+    res.write("data: [DONE]\n\n");
+    res.end();
+  } catch (error) {
+    if (!res.headersSent) {
+      throw error;
+    }
+    console.warn(
+      `[${nowIso()}] tool emulation stream failed model=${model}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    res.end();
+  }
+  logDone(streamStartedAt);
 }
 
 export function createVeniceOpenAiProxyServer(
@@ -1262,6 +1513,30 @@ export function createVeniceOpenAiProxyServer(
           payload.model === AGENTIC_MODEL_NAME
             ? proxy.agentic.workflowTarget()
             : proxy.agentic.agentEndpointTarget(payload.model);
+
+        // Requests with usable tools (and emulation on) take their own path;
+        // everything below is the unchanged tool-less handling.
+        const toolEmulation = resolveToolEmulation(payload, { enabled: TOOL_EMULATION_ENABLED });
+        if (toolEmulation && agentTarget) {
+          // Venice's agent endpoints route tool calls to their own server-side
+          // functions ("Tool not found") and run no client tools, so emulation
+          // fails there; say so instead of answering badly.
+          json(res, 400, {
+            error: {
+              message: `Tool calling is not supported for model "${payload.model}": Venice's agent endpoint only runs its own server-side tools. Use a chat model, or send the request without tools.`,
+              type: "invalid_request_error",
+              param: "tools",
+              code: "tools_not_supported",
+            },
+          });
+          logOutgoingResponse({ req, url, status: 400, model: agentTarget.agentModelId, durationMs: Date.now() - startedAt });
+          return;
+        }
+        if (toolEmulation) {
+          await respondWithToolEmulation({ req, res, url, startedAt, proxy, payload, toolEmulation });
+          return;
+        }
+
         if (agentTarget) {
           const agentModelId = agentTarget.agentModelId;
           // The session keeps the outerface connection open until
