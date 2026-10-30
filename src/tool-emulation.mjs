@@ -8,10 +8,18 @@ import { normalizeOpenAiContent } from "./openai-content.mjs";
 
 const OPEN_TAG = "<tool_call";
 const CLOSE_TAG = "</tool_call>";
+const PROXY_OPEN_TAG = "<proxy_call";
+const PROXY_CLOSE_TAG = "</proxy_call>";
 
 // Tags that open a call block in model output. Wrapper tags need a ">" (after
-// optional whitespace) and their body excludes the tags.
-const CALL_TAGS = [{ open: OPEN_TAG, close: CLOSE_TAG, wrapper: true }];
+// optional whitespace) and their body excludes the tags. Qwen XML models
+// sometimes drop the <tool_call> wrapper and write <function=NAME>…</function>
+// alone; that block keeps its tag in the body.
+const CALL_TAGS = [
+  { open: OPEN_TAG, close: CLOSE_TAG, wrapper: true },
+  { open: PROXY_OPEN_TAG, close: PROXY_CLOSE_TAG, wrapper: true },
+  { open: "<function=", close: "</function>", wrapper: false },
+];
 const SNIPPET_MAX_CHARS = 200;
 
 export function parseToolEmulationSetting(value) {
@@ -72,6 +80,127 @@ function escapeAttribute(value) {
   return String(value).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 }
 
+function toolDefinitionJson(tool) {
+  return JSON.stringify({
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters ?? { type: "object", properties: {} },
+    },
+  });
+}
+
+// Lists tools the way GLM and Qwen chat templates do: one JSON definition per
+// line inside <tools></tools>.
+function nativeToolList(tools) {
+  return [
+    "# Tools",
+    "",
+    "You may call one or more functions to assist with the user query.",
+    "",
+    "You are provided with function signatures within <tools></tools> XML tags:",
+    "<tools>",
+    ...tools.map(toolDefinitionJson),
+    "</tools>",
+  ];
+}
+
+// Qwen3.5+ and Qwen3-Coder chat templates: the call format and its rules,
+// verbatim, after the tool list.
+const QWEN_XML_CALL_INSTRUCTIONS = [
+  "If you choose to call a function ONLY reply in the following format with NO suffix:",
+  "",
+  "<tool_call>",
+  "<function=example_function_name>",
+  "<parameter=example_parameter_1>",
+  "value_1",
+  "</parameter>",
+  "<parameter=example_parameter_2>",
+  "This is the value for the second parameter",
+  "that can span",
+  "multiple lines",
+  "</parameter>",
+  "</function>",
+  "</tool_call>",
+  "",
+  "<IMPORTANT>",
+  "Reminder:",
+  "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags",
+  "- Required parameters MUST be specified",
+  "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after",
+  "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls",
+  "</IMPORTANT>",
+];
+
+// Jinja's `| string` of a scalar, as the Qwen3-Coder template prints it.
+function jinjaString(value) {
+  if (value === true || value === false) {
+    return value ? "True" : "False";
+  }
+  return value === null ? "None" : String(value);
+}
+
+// The Qwen3-Coder template's render_extra_keys macro.
+function renderExtraKeys(object, handledKeys) {
+  if (!isPlainObject(object)) {
+    return "";
+  }
+  return Object.entries(object)
+    .filter(([key]) => !handledKeys.includes(key))
+    .map(([key, value]) => `\n<${key}>${value !== null && typeof value === "object" ? JSON.stringify(value) : jinjaString(value)}</${key}>`)
+    .join("");
+}
+
+// Qwen3-Coder lists tools as XML rather than JSON.
+function qwenCoderToolList(tools) {
+  const entries = tools.map((tool) => {
+    let text = `\n<function>\n<name>${tool.name}</name>`;
+    if (tool.description) {
+      text += `\n<description>${tool.description}</description>`;
+    }
+    text += "\n<parameters>";
+    const properties = tool.parameters?.properties;
+    if (isPlainObject(properties)) {
+      for (const [name, fields] of Object.entries(properties)) {
+        text += `\n<parameter>\n<name>${name}</name>`;
+        if (fields?.type !== undefined) {
+          text += `\n<type>${Array.isArray(fields.type) ? JSON.stringify(fields.type) : fields.type}</type>`;
+        }
+        if (typeof fields?.description === "string") {
+          text += `\n<description>${fields.description.trim()}</description>`;
+        }
+        text += `${renderExtraKeys(fields, ["name", "type", "description"])}\n</parameter>`;
+      }
+    }
+    text += `${renderExtraKeys(tool.parameters, ["type", "properties"])}\n</parameters>\n</function>`;
+    return text;
+  });
+  return ["# Tools", "", "You have access to the following functions:", "", `<tools>${entries.join("")}`, "</tools>"];
+}
+
+// <tool_call><function=NAME><parameter=KEY>VALUE</parameter>…: string values
+// raw, others as JSON (Qwen3.5+ template; Coder prints scalars via | string).
+function renderQwenXmlCall(name, args) {
+  if (!isPlainObject(args)) {
+    return TOOL_FORMATS.json.renderCall(name, args);
+  }
+  const parameters = Object.entries(args).map(
+    ([key, value]) => `<parameter=${key}>\n${typeof value === "string" ? value : JSON.stringify(value)}\n</parameter>\n`,
+  );
+  return `${OPEN_TAG}>\n<function=${name}>\n${parameters.join("")}</function>\n${CLOSE_TAG}`;
+}
+
+// Spelling out "real line breaks, never \\n" made Qwen3-Coder over-correct
+// (it turned a \\n that belongs in source code into a line break: 5/20 exact,
+// against 5/10 with this wording), so the rule stays short.
+const QWEN_XML_FORMAT_RULES = [
+  "- Write each parameter value exactly as it is, with no surrounding quotes and no escaping, even when it spans several lines. Write numbers, booleans, arrays and objects as JSON.",
+];
+const QWEN_XML_EXAMPLE = "<tool_call>\n<function=TOOL_NAME>\n<parameter=ARGUMENT>\nVALUE\n</parameter>\n</function>\n</tool_call>";
+const QWEN_XML_REMINDER =
+  "to call a tool, write <tool_call><function=TOOL_NAME><parameter=KEY>VALUE</parameter></function></tool_call>; values raw, never JSON-escaped.";
+
 // The generic tool list: name, description and compact JSON Schema per tool,
 // then the tagged-JSON call format under the given tag.
 function describeTaggedJson(tools, tag) {
@@ -105,8 +234,13 @@ function renderTaggedResult(tag, { name, id, content }) {
   return `<${tag} name="${escapeAttribute(name)}"${idPart}>${content}</${tag}>`;
 }
 
-// What the model is asked to write: the instructions, and how earlier calls
-// and results are rendered into history.
+function nativeToolResult({ content }) {
+  return `<tool_response>\n${content}\n</tool_response>`;
+}
+
+// What the model is asked to write, per format. Every format is accepted on
+// the way back (see parseCallBody); this only picks the instructions and how
+// earlier calls and results are rendered into history.
 const TOOL_FORMATS = {
   // Generic tagged JSON, for models without a known native format.
   json: {
@@ -126,7 +260,183 @@ const TOOL_FORMATS = {
       return renderTaggedResult("tool_result", { name, id, content });
     },
   },
+
+  // Tagged JSON under a tag no server-side tool parser knows, for models whose
+  // <tool_call> blocks Venice consumes before they reach the proxy (Qwen 3.5+).
+  // The prompt never spells out that tag: a model told "never <tool_call>"
+  // repeats it while thinking, and Venice then cuts everything from there on,
+  // the real <proxy_call> included (seen in raw dumps of empty replies).
+  proxy: {
+    tag: "proxy_call",
+    describe(tools) {
+      return describeTaggedJson(tools, "proxy_call");
+    },
+    formatRules: [
+      '- Inside each <proxy_call> block put exactly one valid JSON object with the keys "name" and "arguments". "arguments" is a JSON object that matches the tool\'s parameters. No markdown code fences, comments or other text inside the tags.',
+      "- Always use <proxy_call> tags. Do not write any other tool-call tag or syntax, not even while thinking: other tags are removed before your reply arrives, together with everything after them.",
+    ],
+    resultDescription: '<proxy_result name="TOOL_NAME" id="CALL_ID">...</proxy_result> blocks',
+    example: '<proxy_call>{"name": "TOOL_NAME", "arguments": {"ARGUMENT": "VALUE"}}</proxy_call>',
+    reminder: 'to call a tool, write <proxy_call>{"name": "TOOL_NAME", "arguments": {...}}</proxy_call> with valid JSON inside; no other tool-call tags, not even in your reasoning.',
+    renderCall(name, args) {
+      return `${PROXY_OPEN_TAG}>${JSON.stringify({ name, arguments: args })}${PROXY_CLOSE_TAG}`;
+    },
+    renderResult({ name, id, content }) {
+      return renderTaggedResult("proxy_result", { name, id, content });
+    },
+  },
+
+  // GLM's native XML-ish format (GLM-4.5+ chat template).
+  glm: {
+    describe(tools) {
+      return [
+        ...nativeToolList(tools),
+        "",
+        "For each function call, output the function name and arguments within the following XML format:",
+        "<tool_call>{function-name}",
+        "<arg_key>{arg-key-1}</arg_key>",
+        "<arg_value>{arg-value-1}</arg_value>",
+        "<arg_key>{arg-key-2}</arg_key>",
+        "<arg_value>{arg-value-2}</arg_value>",
+        "...",
+        "</tool_call>",
+      ];
+    },
+    formatRules: [
+      "- Write string values inside <arg_value> exactly as they are: no surrounding quotes and no escaping, even when they span several lines. Write numbers, booleans, arrays and objects as JSON.",
+      "- Do not write the call as JSON and do not wrap it in code fences.",
+    ],
+    resultDescription: "<tool_response>...</tool_response> blocks, in the order of your calls",
+    example: "<tool_call>TOOL_NAME\n<arg_key>ARGUMENT</arg_key>\n<arg_value>VALUE</arg_value>\n</tool_call>",
+    reminder:
+      "to call a tool, write <tool_call>TOOL_NAME then <arg_key>KEY</arg_key><arg_value>VALUE</arg_value> for each argument, then </tool_call>; string values raw, never JSON.",
+    renderCall(name, args) {
+      if (!isPlainObject(args)) {
+        return TOOL_FORMATS.json.renderCall(name, args);
+      }
+      const pairs = Object.entries(args).map(
+        ([key, value]) =>
+          `\n<arg_key>${key}</arg_key>\n<arg_value>${typeof value === "string" ? value : JSON.stringify(value)}</arg_value>`,
+      );
+      return `${OPEN_TAG}>${name}${pairs.join("")}\n${CLOSE_TAG}`;
+    },
+    renderResult: nativeToolResult,
+  },
+
+  // Qwen's tagged JSON (Qwen2.5, Qwen3 incl. 2507, Qwen3-VL chat templates).
+  qwen: {
+    describe(tools) {
+      return [
+        ...nativeToolList(tools),
+        "",
+        "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:",
+        "<tool_call>",
+        '{"name": <function-name>, "arguments": <args-json-object>}',
+        "</tool_call>",
+      ];
+    },
+    formatRules: [
+      '- Inside each <tool_call> block put exactly one valid JSON object with the keys "name" and "arguments". No markdown code fences or other text inside the tags.',
+    ],
+    resultDescription: "<tool_response>...</tool_response> blocks, in the order of your calls",
+    example: '<tool_call>\n{"name": "TOOL_NAME", "arguments": {"ARGUMENT": "VALUE"}}\n</tool_call>',
+    reminder: 'to call a tool, write <tool_call>{"name": "TOOL_NAME", "arguments": {...}}</tool_call> with valid JSON inside.',
+    renderCall(name, args) {
+      return `${OPEN_TAG}>\n{"name": ${JSON.stringify(name)}, "arguments": ${JSON.stringify(args)}}\n${CLOSE_TAG}`;
+    },
+    renderResult: nativeToolResult,
+  },
+
+  // Qwen3.5 and later (3.6, 3.8) template: XML calls, tools listed as JSON
+  // lines. Opt-in only: Venice strips these calls upstream.
+  "qwen-xml": {
+    describe(tools) {
+      return [
+        "# Tools",
+        "",
+        "You have access to the following functions:",
+        "",
+        "<tools>",
+        ...tools.map(toolDefinitionJson),
+        "</tools>",
+        "",
+        ...QWEN_XML_CALL_INSTRUCTIONS,
+      ];
+    },
+    formatRules: QWEN_XML_FORMAT_RULES,
+    resultDescription: "<tool_response>...</tool_response> blocks, in the order of your calls",
+    example: QWEN_XML_EXAMPLE,
+    reminder: QWEN_XML_REMINDER,
+    renderCall: renderQwenXmlCall,
+    renderResult: nativeToolResult,
+  },
+
+  // Qwen3-Coder: the same XML calls, tools listed as XML.
+  "qwen-coder": {
+    describe(tools) {
+      return [...qwenCoderToolList(tools), "", ...QWEN_XML_CALL_INSTRUCTIONS];
+    },
+    formatRules: QWEN_XML_FORMAT_RULES,
+    resultDescription: "<tool_response>...</tool_response> blocks, in the order of your calls",
+    example: QWEN_XML_EXAMPLE,
+    reminder: QWEN_XML_REMINDER,
+    renderCall: renderQwenXmlCall,
+    renderResult: nativeToolResult,
+  },
 };
+
+export const TOOL_FORMAT_NAMES = Object.keys(TOOL_FORMATS);
+
+// Model id → format, checked in order; the first match wins. Templates say
+// Qwen3-Coder and Qwen 3.5+ use XML calls and Qwen3, Qwen3-2507 and Qwen3-VL
+// tagged JSON, but live runs decide where they disagree:
+//
+// Qwen3-Coder gets the generic JSON format: in the opencode-like check it
+// wrote the exact file in 20/20 runs with JSON and 5/20 with its native XML
+// (escaping or unescaping backslashes in raw values).
+//
+// Qwen 3.5 and later ("qwen3-6-27b", "qwen-3-8-27b") get the neutral proxy
+// format: Venice parses their <tool_call> blocks server-side and drops them.
+// A raw dump of /api/inference/chat for Qwen 3.8 showed only meta/content
+// events with the call cut out of the text, even mid-reasoning; Qwen 3.6 did
+// the same (no call, no parser warning, only whitespace left). The version
+// must be followed by "-", "." or the end: "qwen3-8b" is Qwen3 8B, not 3.8.
+const DEFAULT_FORMAT_RULES = [
+  { match: /glm/, format: "glm" },
+  { match: /qwen-?3[.-]?coder/, format: "json" },
+  { match: /qwen-?3[.-][5-9](?=[-.]|$)/, format: "proxy" },
+  { match: /qwen/, format: "qwen" },
+];
+
+// Parses VENICE_TOOL_FORMATS, e.g. "glm=json,kimi=qwen,*=json". Entries are
+// matched before the defaults; "*" matches every model.
+export function parseToolFormatRules(value) {
+  const rules = [];
+  const invalid = [];
+  for (const entry of typeof value === "string" ? value.split(",") : []) {
+    const trimmed = entry.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const [pattern, format] = trimmed.split("=").map((part) => part?.trim().toLowerCase());
+    if (pattern && TOOL_FORMATS[format]) {
+      rules.push({ pattern, format });
+    } else {
+      invalid.push(trimmed);
+    }
+  }
+  return { rules, invalid };
+}
+
+export function resolveToolFormat(model, rules = []) {
+  const id = typeof model === "string" ? model.toLowerCase() : "";
+  for (const rule of [...rules, ...DEFAULT_FORMAT_RULES]) {
+    if (rule.match ? rule.match.test(id) : rule.pattern === "*" || id.includes(rule.pattern)) {
+      return rule.format;
+    }
+  }
+  return "json";
+}
 
 export function buildToolSystemPrompt(tools, toolChoice = "auto", { parallel = true, format = "json" } = {}) {
   const normalizedTools = normalizeTools(tools);
@@ -302,7 +612,7 @@ export function appendToolReminder(messages, format = "json") {
 }
 
 // Returns null when the request should keep the old, tool-less behavior.
-export function resolveToolEmulation(payload, { enabled = true } = {}) {
+export function resolveToolEmulation(payload, { enabled = true, model = payload?.model, formatRules = [] } = {}) {
   if (!enabled || !Array.isArray(payload?.tools)) {
     return null;
   }
@@ -312,7 +622,7 @@ export function resolveToolEmulation(payload, { enabled = true } = {}) {
     return null;
   }
   const parallel = payload.parallel_tool_calls !== false;
-  const format = "json";
+  const format = resolveToolFormat(model, formatRules);
   const toolPrompt = buildToolSystemPrompt(payload.tools, toolChoice, { parallel, format });
   return {
     tools,
@@ -358,14 +668,176 @@ export function indexTools(tools) {
   return index;
 }
 
+// A call missing a required argument would fail in the client anyway, so it
+// counts as unparsed (and can be retried) rather than being returned.
 function buildToolCall(tool, args) {
+  const name = tool.name;
+  const required = Array.isArray(tool.parameters?.required) ? tool.parameters.required : [];
+  const missing = required.filter((key) => !(key in args));
+  if (missing.length > 0) {
+    return { error: `missing required argument${missing.length > 1 ? "s" : ""} ${missing.map((key) => `"${key}"`).join(", ")} for "${name}"` };
+  }
   return {
     toolCall: {
       id: createToolCallId(),
       type: "function",
-      function: { name: tool.name, arguments: JSON.stringify(args) },
+      function: { name, arguments: JSON.stringify(args) },
     },
   };
+}
+
+// Models often put raw newlines or tabs inside JSON strings (a file body,
+// say). Escapes control characters that sit inside string literals.
+export function escapeControlCharsInStrings(text) {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+  for (const char of text) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      } else if (char < " ") {
+        result +=
+          char === "\n" ? "\\n" : char === "\r" ? "\\r" : char === "\t" ? "\\t" : `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`;
+        continue;
+      }
+    } else if (char === '"') {
+      inString = true;
+    }
+    result += char;
+  }
+  return result;
+}
+
+// The first balanced {...} in text (string-aware), or null.
+function extractJsonObject(text) {
+  const start = text.indexOf("{");
+  if (start === -1) {
+    return null;
+  }
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+    } else if (char === '"') {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, index + 1);
+      }
+    }
+  }
+  return null;
+}
+
+// JSON.parse, then with control characters escaped, then on the first
+// balanced object only (drops trailing junk such as stray closing tags).
+// Returns { value } or null.
+export function parseJsonLenient(text, { whole = false } = {}) {
+  const attempts = [text];
+  const repaired = escapeControlCharsInStrings(text);
+  if (repaired !== text) {
+    attempts.push(repaired);
+  }
+  const extracted = whole ? null : extractJsonObject(repaired);
+  if (extracted && extracted !== repaired.trim()) {
+    attempts.push(extracted);
+  }
+  for (const attempt of attempts) {
+    try {
+      return { value: JSON.parse(attempt) };
+    } catch {
+      // Try the next repair.
+    }
+  }
+  return null;
+}
+
+function schemaTypes(schema) {
+  if (schema?.type === undefined) {
+    return [];
+  }
+  return Array.isArray(schema.type) ? schema.type : [schema.type];
+}
+
+// Turns one raw <arg_value> into a JSON value: string-typed parameters keep the
+// text as written, anything else is read as JSON when it parses (like vLLM's
+// GLM parser), with Python literals tolerated.
+function convertArgValue(raw, schema) {
+  const types = schemaTypes(schema);
+  if (types.length > 0 && types.every((type) => type === "string" || type === "null")) {
+    return raw;
+  }
+  const text = raw.trim();
+  const parsed = parseJsonLenient(text);
+  if (parsed) {
+    return parsed.value;
+  }
+  if (text === "True" || text === "False") {
+    return text === "True";
+  }
+  if (text === "None") {
+    return null;
+  }
+  return raw;
+}
+
+const ARG_PAIR_RE = /<arg_key>([\s\S]*?)<\/arg_key>\s*<arg_value>([\s\S]*?)(<\/arg_value>|$)/g;
+
+// Qwen XML parameters, as vLLM reads them: a value ends at </parameter> or,
+// when that is missing, at the next <parameter=, </function> or the end.
+const QWEN_PARAM_RE =
+  /<\s*parameter\s*=\s*([^>]*)>([\s\S]*?)(<\s*\/\s*parameter\s*>|(?=<\s*parameter\s*=)|(?=<\s*\/\s*function\s*>)|$)/g;
+
+// The Qwen template writes "<parameter=KEY>\n" + value + "\n</parameter>", so
+// one newline on each side is markup. They are removed as a pair: a value
+// written without the leading one ("<parameter=content>a\n</parameter>") has
+// no template wrapping, and its trailing newline belongs to the content.
+// (vLLM strips each side on its own, which would drop it.)
+function trimWrappingNewlines(value) {
+  if (!value.startsWith("\n")) {
+    return value;
+  }
+  const inner = value.slice(1);
+  return inner.endsWith("\n") ? inner.slice(0, -1) : inner;
+}
+
+// Key/value pairs (GLM <arg_key>/<arg_value>, Qwen <parameter=KEY>), values
+// converted by schema type. A last value with no closing tag is fine when the
+// block itself was closed (the model just skipped the tag), but in a block
+// cut off at the end of the stream it is truncated: that is an error, so a
+// half-written file is retried rather than returned.
+function parseKeyValueArgs(tool, text, { pattern, trim = (value) => value, terminated }) {
+  const args = {};
+  let found = false;
+  for (const match of text.matchAll(pattern)) {
+    const key = match[1].trim();
+    if (!key) {
+      continue;
+    }
+    if (!terminated && match[3] === "" && match.index + match[0].length === text.length) {
+      return { error: `argument "${key}" for "${tool.name}" was cut off` };
+    }
+    args[key] = convertArgValue(trim(match[2]), tool.parameters?.properties?.[key]);
+    found = true;
+  }
+  return found ? buildToolCall(tool, args) : { error: `no arguments found for "${tool.name}"` };
 }
 
 function parseJsonArgs(tool, value) {
@@ -375,11 +847,11 @@ function parseJsonArgs(tool, value) {
     if (!args.trim()) {
       args = {};
     } else {
-      try {
-        args = JSON.parse(args);
-      } catch {
+      const parsed = parseJsonLenient(args);
+      if (!parsed) {
         return { error: `invalid JSON arguments for "${name}"` };
       }
+      args = parsed.value;
     }
   }
   if (!isPlainObject(args)) {
@@ -388,16 +860,11 @@ function parseJsonArgs(tool, value) {
   return buildToolCall(tool, args);
 }
 
-// Parses the inside of a <tool_call> block: a JSON object {"name",
-// "arguments"|"parameters"}, or the OpenAI shape {"function": {"name",
-// "arguments"}}. Returns { toolCall } or { error }.
-export function parseCallBody(raw, tools) {
-  const index = indexTools(tools);
-  const body = stripFence(String(raw).trim());
-  let parsed;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
+// JSON call object: {"name", "arguments"|"parameters"} or the OpenAI shape
+// {"function": {"name", "arguments"}}.
+function parseJsonCall(body, tools) {
+  const parsed = parseJsonLenient(body)?.value;
+  if (parsed === undefined) {
     return { error: "invalid JSON" };
   }
   if (!isPlainObject(parsed)) {
@@ -407,11 +874,85 @@ export function parseCallBody(raw, tools) {
   if (typeof call.name !== "string") {
     return { error: "missing tool name" };
   }
-  const tool = index.get(call.name);
+  const tool = tools.get(call.name);
   if (!tool) {
     return { error: `unknown tool "${call.name}"` };
   }
   return parseJsonArgs(tool, call.arguments ?? call.parameters);
+}
+
+// A key tag that runs straight into JSON, as models do when they drift from
+// their native format: GLM "write<arg_key>path": "a", "content": "b"}" or Qwen
+// "<parameter=path": "a", ...}". Rebuilds the object and parses it leniently.
+function parseHybridArgs(tool, text) {
+  let body = text.trim();
+  const closing = /\s*<\s*\/\s*(?:arg_value|arg_key|parameter|function|tool_call|proxy_call)\s*>$/;
+  while (closing.test(body)) {
+    body = body.replace(closing, "").trimEnd();
+  }
+  const json = body.startsWith("{") ? body : body.startsWith('"') ? `{${body}` : `{"${body}`;
+  const parsed = parseJsonLenient(json.endsWith("}") ? json : `${json}}`);
+  if (!parsed || !isPlainObject(parsed.value)) {
+    return { error: `invalid arguments for "${tool.name}"` };
+  }
+  return buildToolCall(tool, parsed.value);
+}
+
+// Whatever follows the tool name: GLM pairs, Qwen parameters, a JSON object,
+// or a hybrid of a key tag and JSON.
+function parseCallArguments(tool, rest, terminated) {
+  if (!rest.trim()) {
+    return buildToolCall(tool, {});
+  }
+  if (rest.startsWith("{")) {
+    return parseJsonArgs(tool, rest);
+  }
+  if (rest.startsWith("<arg_key>")) {
+    return rest.includes("</arg_key>")
+      ? parseKeyValueArgs(tool, rest, { pattern: ARG_PAIR_RE, terminated })
+      : parseHybridArgs(tool, rest.slice("<arg_key>".length));
+  }
+  const parameter = /^<\s*parameter\s*=\s*([^>]*)>?/.exec(rest);
+  if (parameter) {
+    // A quote in the "key" means JSON took over after "<parameter=".
+    return parameter[1].includes('"')
+      ? parseHybridArgs(tool, rest.slice(rest.indexOf("=") + 1))
+      : parseKeyValueArgs(tool, rest, { pattern: QWEN_PARAM_RE, trim: trimWrappingNewlines, terminated });
+  }
+  return { error: `unrecognized arguments for "${tool.name}"` };
+}
+
+// Body that starts with the tool name (GLM), or with <function=NAME> (Qwen
+// XML, with or without the closing </function>).
+function parseNamedCall(body, tools, terminated) {
+  const fn = /^<\s*function\s*=\s*([^>\s]+)\s*>\s*/.exec(body);
+  const match = fn ?? /^([^\s<{"]+)\s*/.exec(body);
+  if (!match) {
+    return { error: "missing tool name" };
+  }
+  const name = match[1];
+  const tool = tools.get(name);
+  if (!tool) {
+    return { error: `unknown tool "${name}"` };
+  }
+  let rest = body.slice(match[0].length);
+  if (fn) {
+    const closed = /\s*<\s*\/\s*function\s*>\s*$/.exec(rest);
+    if (closed) {
+      rest = rest.slice(0, closed.index);
+      terminated = true;
+    }
+  }
+  return parseCallArguments(tool, rest, terminated);
+}
+
+// Parses the inside of a call block, whatever format the model used.
+// `terminated` is false for a block cut off at the end of the stream.
+// Returns { toolCall } or { error }.
+export function parseCallBody(raw, tools, { terminated = true } = {}) {
+  const index = indexTools(tools);
+  const body = stripFence(String(raw).trim());
+  return body.startsWith("{") ? parseJsonCall(body, index) : parseNamedCall(body, index, terminated);
 }
 
 // Fallback for replies that skip the tags: the whole reply, or one fenced block,
@@ -430,12 +971,7 @@ function parseUntaggedCall(text, tools) {
   if (body === null) {
     return { error: null };
   }
-  let parsed;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return { error: null };
-  }
+  const parsed = parseJsonLenient(body, { whole: true })?.value;
   // Ordinary JSON answers are not tool attempts; only a {name, arguments}
   // shape is parsed (and warned about when it does not resolve).
   const call = isPlainObject(parsed?.function) ? parsed.function : parsed;
@@ -561,9 +1097,10 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
       if (mode === "text") {
         if (toolCallCount > 0) {
           // After a call only another call may follow; anything else (an
-          // apology, a "fixed" retry, a summary) ends the reply. A stray
-          // </tool_call> is skipped.
-          const trimmed = buffer.trimStart().replace(/^(?:<\/tool_call>\s*)+/, "");
+          // apology, a "fixed" retry, a summary) ends the reply. Stray
+          // wrapper closers (e.g. </tool_call> after a bare <function=…>)
+          // are skipped.
+          const trimmed = buffer.trimStart().replace(/^(?:<\/(?:tool_call|proxy_call)>\s*)+/, "");
           if (!trimmed || CALL_TAGS.some((tag) => tag.wrapper && tag.close.startsWith(trimmed))) {
             buffer = trimmed;
             return;
@@ -620,7 +1157,7 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
         continue;
       }
 
-      // mode === "tag"
+      // mode === "tag"; a bare <function=…> block keeps its tag in the body.
       const closeIndex = buffer.indexOf(currentTag.close);
       if (closeIndex === -1) {
         return;
@@ -675,7 +1212,7 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
       if (mode === "tag") {
         // Unterminated block, usually an output-length cut-off.
         const body = buffer;
-        const result = parseCallBody(body, known);
+        const result = parseCallBody(body, known, { terminated: false });
         emitCall(
           result.toolCall ? result : { error: `unterminated tool call (${result.error})` },
           `${openTagText}${body}`,

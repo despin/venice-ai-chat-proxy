@@ -7,8 +7,10 @@ import { normalizeOpenAiContent } from "./openai-content.mjs";
 import {
   buildToolCallDeltas,
   parseToolEmulationSetting,
+  parseToolFormatRules,
   resolveToolEmulation,
   runToolEmulation,
+  TOOL_FORMAT_NAMES,
   truncateSnippet,
 } from "./tool-emulation.mjs";
 
@@ -30,8 +32,15 @@ const AGENTIC_MODEL_NAME = process.env.VENICE_AGENTIC_MODEL_NAME?.trim() || "age
 // Prompt-based tool calling for requests that send `tools`; "off" restores the
 // old behavior of ignoring them.
 const TOOL_EMULATION_ENABLED = parseToolEmulationSetting(process.env.VENICE_TOOL_EMULATION);
+// Per-model tool-call format overrides, e.g. "glm=json,kimi=qwen-xml,*=json".
+const TOOL_FORMAT_RULES = parseToolFormatRules(process.env.VENICE_TOOL_FORMATS);
 // Forced off (with includeVeniceSystemPrompt) whenever tools are emulated.
 const TOOL_EMULATION_DISABLED_FEATURES = ["webEnabled", "webScrapeEnabled", "xSearchEnabled"];
+if (TOOL_FORMAT_RULES.invalid.length > 0) {
+  console.warn(
+    `VENICE_TOOL_FORMATS: ignoring ${TOOL_FORMAT_RULES.invalid.join(", ")} (expected pattern=format, format one of ${TOOL_FORMAT_NAMES.join("|")})`,
+  );
+}
 // Venice's own system prompt is off unless a caller asks for it via the model
 // suffix; set explicitly so streaming and non-streaming paths never disagree.
 const DEFAULT_INCLUDE_VENICE_SYSTEM_PROMPT = false;
@@ -702,6 +711,7 @@ function logRequestTranslation({
   if (toolEmulation) {
     parts.push(`tools=${toolEmulation.tools.length}`);
     parts.push(`tool_choice=${toolEmulation.toolChoiceLabel}`);
+    parts.push(`tool_format=${toolEmulation.format}`);
     if (toolOverrides.length > 0) {
       parts.push(`disabled_for_tools=${toolOverrides.join(",")}`);
     }
@@ -1516,7 +1526,11 @@ export function createVeniceOpenAiProxyServer(
 
         // Requests with usable tools (and emulation on) take their own path;
         // everything below is the unchanged tool-less handling.
-        const toolEmulation = resolveToolEmulation(payload, { enabled: TOOL_EMULATION_ENABLED });
+        const toolEmulation = resolveToolEmulation(payload, {
+          enabled: TOOL_EMULATION_ENABLED,
+          model: payload.model ?? proxy.client.model,
+          formatRules: TOOL_FORMAT_RULES.rules,
+        });
         if (toolEmulation && agentTarget) {
           // Venice's agent endpoints route tool calls to their own server-side
           // functions ("Tool not found") and run no client tools, so emulation
