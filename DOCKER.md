@@ -12,7 +12,7 @@ Create the session file on the host if you want to seed an existing session, or 
 $env:VENICE_EMAIL="you@example.com"
 $env:VENICE_PASSWORD="your-password"
 $env:VENICE_SESSION_FILE="$PWD\\.venice-web-session.json"
-node .\venice-login.mjs
+npm run login
 ```
 
 **Run Container**
@@ -50,9 +50,11 @@ services:
       VENICE_PASSWORD: ${VENICE_PASSWORD}
       VENICE_SESSION_FILE: /data/.venice-web-session.json
     volumes:
-      - ./.venice-web-session.json:/data/.venice-web-session.json
+      - ./venice-session:/data
     restart: unless-stopped
 ```
+
+To seed an existing session, copy `.venice-web-session.json` into `./venice-session/` before the first start.
 
 There is also a ready-to-use example file at `docker-compose.example.yml`.
 

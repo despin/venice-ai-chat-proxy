@@ -31,19 +31,24 @@ The proxy translates OpenAI-style chat requests into Venice web requests, then t
 
 Main scripts in this repo:
 
-- `venice-openai-proxy.mjs`: OpenAI-compatible proxy server
-- `venice-web-poc.mjs`: Venice web auth/session client
-- `venice-login.mjs`: local login utility that creates the session file
-- `venice-start.mjs`: startup entrypoint that authenticates first, then starts the proxy
-- `check-proxy-models.mjs`: quick `/v1/models` smoke test
-- `convert-venice-chat.mjs`: transcript-to-import JSON converter
+- `index.mjs`: startup entrypoint that authenticates first, then starts the proxy (`npm start`)
+- `src/proxy.mjs`: OpenAI-compatible proxy server (`npm run proxy`)
+- `src/client.mjs`: Venice web auth/session client (`npm run poc`)
+- `src/agentic.mjs`: agent/workflow endpoint support used by the proxy
+- `scripts/login.mjs`: local login utility that creates the session file (`npm run login`)
+- `scripts/login-wreq.mjs`: browserless Clerk login flow used by `scripts/login.mjs`
+- `scripts/convert.mjs`: transcript-to-import JSON converter (`npm run convert:chat`)
+- `scripts/deploy.sh`: builds and restarts the Compose service with the current commit stamped into the image
+- `check/models.mjs`: quick `/v1/models` smoke test (`npm run check:models`)
+- `check/openai.mjs`: test run against a running proxy with the official `openai` client (`npm run check:openai-client`)
+- `check/concurrency.mjs`: parallel streaming test (`npm run check:concurrency`)
 - `docker-compose.example.yml`: example Compose setup
 
 ## Local setup
 
 ### 1. Set credentials
 
-For local testing, edit `venice-login.json`:
+For local testing, create `venice-login.json` in the project root (it is git-ignored):
 
 ```json
 {
@@ -78,7 +83,7 @@ npm install
 Then:
 
 ```powershell
-node .\venice-login.mjs
+npm run login
 ```
 
 This performs a fresh Clerk credential login without Chrome. It uses the npm package `wreq-js`, a native Node HTTP client with browser TLS/HTTP fingerprint profiles, so the network layer looks like Chrome to Clerk. It validates the Venice web session and writes `.venice-web-session.json` by default.
@@ -103,7 +108,7 @@ code, and saves the pending sign-in attempt (plus its cookies) to
 Then finish the login with the emailed (or authenticator) code:
 
 ```powershell
-node .\scripts\login.mjs --mfa-code 123456
+npm run login -- --mfa-code 123456
 ```
 
 `--mfa-code` with no value prompts for the code, and `VENICE_MFA_CODE` works too. On
@@ -114,10 +119,10 @@ saved cookies mark the device as trusted, later logins usually skip the second f
 Optional modes:
 
 ```powershell
-node .\venice-login.mjs --restore
-node .\venice-login.mjs --restore-only
-node .\venice-login.mjs --direct
-node .\venice-login.mjs --clean-session
+npm run login:restore
+npm run login:restore-only
+npm run login:direct
+npm run clean-session
 ```
 
 `--restore-only` refreshes from the saved session/cookies and never falls back to credential login. `--restore` keeps the older restore/direct fallback behavior for debugging. `--direct` uses the plain Node fetch implementation, which is useful for confirming Clerk bot/rate rejection but is not the normal login path. `--clean-session` removes saved Venice session files, including the configured `VENICE_SESSION_FILE` and the default `.venice-web-session.json`, without deleting `venice-login.json`.
@@ -182,13 +187,13 @@ npm run clean-session
 If you want the proxy only:
 
 ```powershell
-node .\venice-openai-proxy.mjs
+npm run proxy
 ```
 
 If you want startup auth/restore first, then the proxy:
 
 ```powershell
-node .\venice-start.mjs
+npm start
 ```
 
 By default it listens on:
@@ -200,7 +205,7 @@ http://127.0.0.1:3456/v1
 ### 4. Smoke test the models endpoint
 
 ```powershell
-node .\check-proxy-models.mjs
+npm run check:models
 ```
 
 That starts an internal proxy instance, calls `/v1/models`, prints the returned models, and exits.
@@ -295,6 +300,8 @@ docker run --rm -p 3456:3456 `
   venice-openai-proxy
 ```
 
+Create `.venice-web-session.json` (for example with `npm run login`) before starting the container. If the file does not exist, Docker creates a directory at that path instead, and login later fails with `EISDIR: illegal operation on a directory`. Mounting a directory to `/data`, as the Compose example does, avoids this.
+
 Container behavior at startup:
 
 - tries to restore `/data/.venice-web-session.json`
@@ -332,9 +339,11 @@ services:
       VENICE_PASSWORD: ${VENICE_PASSWORD}
       VENICE_SESSION_FILE: /data/.venice-web-session.json
     volumes:
-      - ./.venice-web-session.json:/data/.venice-web-session.json
+      - ./venice-session:/data
     restart: unless-stopped
 ```
+
+To seed an existing session, copy `.venice-web-session.json` into `./venice-session/` before the first start.
 
 ## Logging
 
@@ -366,7 +375,7 @@ The proxy logs:
 Run:
 
 ```powershell
-node .\venice-login.mjs
+npm run login
 ```
 
 Or make sure the container has:
@@ -377,7 +386,7 @@ Or make sure the container has:
 
 ### `/v1/models` returns auth errors
 
-Usually this means the session file is stale or missing. Recreate it with `venice-login.mjs` locally, or restart the container with valid credentials so it can refresh the session on startup.
+Usually this means the session file is stale or missing. Recreate it with `npm run login` locally, or restart the container with valid credentials so it can refresh the session on startup.
 
 ### Streaming feels buffered
 
