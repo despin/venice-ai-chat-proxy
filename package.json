@@ -1,6 +1,7 @@
 {
   "scripts": {
     "check:concurrency": "node ./check/concurrency.mjs",
+    "check:messages": "node ./check/messages.mjs",
     "check:models": "node ./check/models.mjs",
     "check:openai-client": "node ./check/openai.mjs",
     "clean-session": "node ./scripts/login.mjs --clean-session",

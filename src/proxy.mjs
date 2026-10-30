@@ -335,17 +335,18 @@ function splitMessages(messages) {
       systemParts.push(content);
       continue;
     }
-    if (role === "tool") {
-      prompt.push({
-        role: "assistant",
-        content: `Tool result:\n${content}`,
-      });
+    const next =
+      role === "tool"
+        ? { role: "assistant", content: `Tool result:\n${content}` }
+        : { role: role === "assistant" ? "assistant" : "user", content };
+    // Venice's chat endpoint keeps only the last of several same-role messages
+    // in a row, so neighbours are merged into one turn instead of being lost.
+    const previous = prompt.at(-1);
+    if (previous?.role === next.role) {
+      previous.content = `${previous.content}\n\n${next.content}`;
       continue;
     }
-    prompt.push({
-      role: role === "assistant" ? "assistant" : "user",
-      content,
-    });
+    prompt.push(next);
   }
   return {
     prompt,

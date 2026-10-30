@@ -157,6 +157,26 @@ async function testMultiTurnConversation(client, model) {
   );
 }
 
+// Venice's chat endpoint keeps only the last of several user messages in a
+// row; the proxy merges them, so the first message must still be seen.
+async function testConsecutiveUserMessages(client, model) {
+  section("POST /v1/chat/completions — consecutive user messages");
+
+  const response = await client.chat.completions.create({
+    model,
+    messages: [
+      { role: "user", content: "Remember the number 41." },
+      { role: "user", content: "Add one to it and reply with just the number." },
+    ],
+    max_tokens: 20,
+    temperature: 0,
+    stream: false,
+  });
+
+  const content = response.choices?.[0]?.message?.content ?? "";
+  ok("answer uses the earlier message", /\b42\b/.test(content), `got: ${JSON.stringify(content)}`);
+}
+
 // ──────────────────────────────────────────────
 // Responses API tests
 // ──────────────────────────────────────────────
@@ -422,6 +442,7 @@ async function main() {
   await testChatCompletionNonStreaming(client, model);
   await testChatCompletionStreaming(client, model);
   await testMultiTurnConversation(client, model);
+  await testConsecutiveUserMessages(client, model);
   await testResponsesNonStreaming(BASE_URL);
   await testResponsesNonStreamingArrayInput(BASE_URL);
   await testResponsesStreaming(BASE_URL);

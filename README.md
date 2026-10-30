@@ -357,6 +357,7 @@ The proxy logs:
 - Fresh login is browserless, but it depends on `wreq-js` Chrome impersonation because Clerk currently rejects plain Node/curl HTTP fingerprints with 429s.
 - Clerk JWTs are short-lived; the session file is important because it persists cookies needed for restore.
 - The proxy does not perform interactive login during requests.
+- Venice's chat endpoint keeps only the last of several same-role messages in a row, so `/v1/chat/completions` merges adjacent user (or assistant) messages into one turn, separated by a blank line. Tool results count as assistant turns, as before.
 - For container startup, login/restore happens once before the server starts.
 
 ## Troubleshooting
