@@ -98,17 +98,23 @@ function safeJsonParse(text) {
   }
 }
 
-async function* parseSseStream(stream) {
+export async function* parseSseStream(stream) {
   if (!stream) return;
 
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  // Set once the body is fully read; leaving earlier cancels the upstream
+  // request (e.g. a tool-call reply that is already complete).
+  let finished = false;
 
   try {
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        finished = true;
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
 
       let boundary;
@@ -147,11 +153,14 @@ async function* parseSseStream(stream) {
       }
     }
   } finally {
+    if (!finished) {
+      await reader.cancel().catch(() => {});
+    }
     reader.releaseLock();
   }
 }
 
-async function* parseJsonLineStream(stream) {
+export async function* parseJsonLineStream(stream) {
   if (!stream) {
     return;
   }
@@ -159,11 +168,15 @@ async function* parseJsonLineStream(stream) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  // Set once the body is fully read; leaving earlier cancels the upstream
+  // request (e.g. a tool-call reply that is already complete).
+  let finished = false;
 
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) {
+        finished = true;
         break;
       }
 
@@ -186,6 +199,9 @@ async function* parseJsonLineStream(stream) {
       yield safeJsonParse(tail);
     }
   } finally {
+    if (!finished) {
+      await reader.cancel().catch(() => {});
+    }
     reader.releaseLock();
   }
 }

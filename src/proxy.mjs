@@ -7,6 +7,7 @@ import { normalizeOpenAiContent } from "./openai-content.mjs";
 import {
   buildToolCallDeltas,
   parseToolEmulationSetting,
+  parseReasoningBudget,
   parseToolFormatRules,
   resolveToolEmulation,
   runToolEmulation,
@@ -34,6 +35,10 @@ const AGENTIC_MODEL_NAME = process.env.VENICE_AGENTIC_MODEL_NAME?.trim() || "age
 const TOOL_EMULATION_ENABLED = parseToolEmulationSetting(process.env.VENICE_TOOL_EMULATION);
 // Per-model tool-call format overrides, e.g. "glm=json,kimi=qwen-xml,*=json".
 const TOOL_FORMAT_RULES = parseToolFormatRules(process.env.VENICE_TOOL_FORMATS);
+// Characters of reasoning a tool request may produce before an answer or call
+// starts (0 = no limit). The longest successful run seen live reasoned for
+// 16.5K characters; a runaway one hit 161K and the 5-minute upstream timeout.
+const TOOL_REASONING_BUDGET = parseReasoningBudget(process.env.VENICE_TOOL_REASONING_BUDGET);
 // Forced off (with includeVeniceSystemPrompt) whenever tools are emulated.
 const TOOL_EMULATION_DISABLED_FEATURES = ["webEnabled", "webScrapeEnabled", "xSearchEnabled"];
 if (TOOL_FORMAT_RULES.invalid.length > 0) {
@@ -219,6 +224,7 @@ function logOutgoingResponse({
   streamDurationMs = null,
   toolCount = null,
   toolCallCount = 0,
+  toolAttempts = 1,
 }) {
   const streamPart =
     typeof streamDurationMs === "number"
@@ -227,7 +233,9 @@ function logOutgoingResponse({
   const modelPart = model ? ` model=${model}` : "";
   // Only requests that went through tool emulation report tool counts.
   const toolsPart =
-    typeof toolCount === "number" ? ` tools=${toolCount} tool_calls=${toolCallCount}` : "";
+    typeof toolCount === "number"
+      ? ` tools=${toolCount} tool_calls=${toolCallCount}${toolAttempts > 1 ? ` tool_attempts=${toolAttempts}` : ""}`
+      : "";
   console.log(
     `[${nowIso()}] outgoing ${req.method} ${url.pathname} status=${status}${modelPart} content_chars=${contentLength} reasoning_chars=${reasoningLength}${toolsPart} duration_ms=${durationMs}${streamPart}`,
   );
@@ -238,9 +246,15 @@ const TOOL_LOG_OUTPUT_MAX_CHARS = 4000;
 // Logs what runToolEmulation reports, raw model outputs included (truncated).
 function logToolEmulationEvent({ type, reason, outputs }, model) {
   const message =
-    type === "unparsed"
-      ? "unparsed tool call; returning the text as content"
-      : "ignoring an unparsed call after a valid one";
+    type === "retry"
+      ? "unparsed tool call; retrying once"
+      : type === "overrun"
+        ? "reasoning overran the budget; cancelled and retrying once"
+        : type === "empty"
+          ? "empty reply; retrying once with the format repeated"
+          : type === "failed"
+            ? "retry failed too"
+            : "ignoring an unparsed call after a valid one";
   const outputPart = outputs
     .map((output, index) => ` output${index + 1}=${JSON.stringify(truncateSnippet(output, TOOL_LOG_OUTPUT_MAX_CHARS))}`)
     .join("");
@@ -1173,6 +1187,9 @@ function* normalizeChatEvent(event, stats, created) {
 // unparsed call can be retried before anything about it is sent.
 async function respondWithToolEmulation({ req, res, url, startedAt, proxy, payload, toolEmulation }) {
   const created = Math.floor(Date.now() / 1000);
+  // Diagnostics for check:tools: with "x-venice-tool-debug: 1" the response
+  // reports how many upstream attempts the reply took (2 after a retry).
+  const reportAttempts = req.headers["x-venice-tool-debug"] === "1";
   let completionId = `chatcmpl_${created}`;
   let model = payload.model || proxy.client.model;
   const stats = createStreamStats();
@@ -1182,17 +1199,19 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
     openAttempt: (messages) => chatAttemptEvents(proxy, payload, toolEmulation, messages, stats),
     onEvent: (event) => logToolEmulationEvent(event, model),
     stats: runStats,
+    reasoningBudget: TOOL_REASONING_BUDGET,
   });
-  const logDone = (streamStartedAt = null) =>
+  const logDone = (streamStartedAt = null, status = 200) =>
     logOutgoingResponse({
       req,
       url,
-      status: 200,
+      status,
       model,
       contentLength: stats.contentLength,
       reasoningLength: stats.reasoningLength,
       toolCount: toolEmulation.tools.length,
       toolCallCount: runStats.toolCalls ?? 0,
+      toolAttempts: runStats.attempts ?? 1,
       durationMs: Date.now() - startedAt,
       streamDurationMs: streamStartedAt === null ? null : Date.now() - streamStartedAt,
     });
@@ -1204,9 +1223,12 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
   if (!payload.stream) {
     let text = "";
     let reasoning = "";
+    let failure = null;
     const toolCalls = [];
     for await (const event of events) {
-      if (event.type === "meta") {
+      if (event.type === "error") {
+        failure = event;
+      } else if (event.type === "meta") {
         applyMeta(event);
       } else if (event.type === "reasoning") {
         reasoning += event.text;
@@ -1215,6 +1237,22 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
       } else if (event.type === "tool_call") {
         toolCalls.push(event.toolCall);
       }
+    }
+    if (failure) {
+      json(res, 504, { error: { message: failure.message, type: "server_error", code: failure.code } });
+      logOutgoingResponse({
+        req,
+        url,
+        status: 504,
+        model,
+        contentLength: stats.contentLength,
+        reasoningLength: stats.reasoningLength,
+        toolCount: toolEmulation.tools.length,
+        toolCallCount: 0,
+        toolAttempts: runStats.attempts ?? 1,
+        durationMs: Date.now() - startedAt,
+      });
+      return;
     }
     const response = buildChatCompletionResponse({
       requestModel: model,
@@ -1226,6 +1264,9 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
     if (reasoning) {
       response.choices[0].message.reasoning_content = reasoning;
     }
+    if (reportAttempts) {
+      response.venice_tool_attempts = runStats.attempts;
+    }
     json(res, 200, response);
     logDone();
     return;
@@ -1234,6 +1275,7 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
   const streamStartedAt = Date.now();
   let firstDeltaSent = false;
   let toolCallIndex = 0;
+  let streamError = null;
   // Headers go out with the first chunk, so a failure to open the upstream
   // still becomes a JSON error.
   const writeDelta = (delta) => {
@@ -1279,7 +1321,28 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
           writeDelta(delta);
         }
         toolCallIndex += 1;
+      } else if (event.type === "error") {
+        streamError = event;
       }
+    }
+
+    if (streamError) {
+      // invalid_request_error is the only error type that stops opencode's
+      // retry loop: with server_error or model_error it re-sent the request
+      // about ten times (opencode 2.2.3). The proxy has already spent its own
+      // retry, so more rounds would only repeat the overrun for minutes.
+      const error = { message: streamError.message, type: "invalid_request_error", code: streamError.code };
+      const status = res.headersSent ? 200 : 504;
+      if (!res.headersSent) {
+        json(res, 504, { error });
+      } else {
+        // OpenAI-style mid-stream error: clients raise it instead of waiting.
+        writeSseChunk(res, { error });
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }
+      logDone(streamStartedAt, status);
+      return;
     }
 
     if (!firstDeltaSent) {
@@ -1300,6 +1363,9 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
       ],
       usage: null,
     };
+    if (reportAttempts) {
+      finishChunk.venice_tool_attempts = runStats.attempts;
+    }
     writeSseChunk(res, finishChunk);
     writeSseChunk(res, { id: completionId, object: "chat.completion.chunk", created, model, choices: [], usage: null });
     res.write("data: [DONE]\n\n");

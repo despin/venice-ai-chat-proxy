@@ -18,11 +18,17 @@ export async function* parseSseStream(stream) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  // Set once the body is fully read; leaving earlier cancels the upstream
+  // request (e.g. a tool-call reply that is already complete).
+  let finished = false;
 
   try {
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        finished = true;
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
 
       let boundary;
@@ -61,6 +67,9 @@ export async function* parseSseStream(stream) {
       }
     }
   } finally {
+    if (!finished) {
+      await reader.cancel().catch(() => {});
+    }
     reader.releaseLock();
   }
 }

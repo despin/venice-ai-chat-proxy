@@ -1273,58 +1273,221 @@ export function buildToolCallDeltas(toolCall, index) {
   ];
 }
 
-// Runs one emulated completion. openAttempt(messages) returns an async
-// iterable of upstream events { type: "meta" | "reasoning" | "content" }.
-// Yields client events { type: "meta" | "reasoning" | "text" | "tool_call" }.
-//
-// Reading stops as soon as the reply is complete: after a call only another
-// call may follow, so the model cannot go on with "let me fix that". A block
-// that cannot be parsed before any call comes back as text; onEvent reports
-// it ("unparsed"), and an unparsed block after a call ("dropped").
-export async function* runToolEmulation({ emulation, openAttempt, onEvent = () => {}, stats = {} }) {
-  stats.attempts = 1;
-  stats.toolCalls = 0;
-  const parser = createToolCallParser(emulation.tools, { maxCalls: emulation.maxCalls });
-  let finished = false;
+// The conversation for the one retry: the unparsed reply goes back to the
+// model with a short correction in its own format.
+export function buildRetryMessages(emulation, output, reason) {
+  const spec = TOOL_FORMATS[emulation.format] ?? TOOL_FORMATS.json;
+  return [
+    ...emulation.messages,
+    { role: "assistant", content: output },
+    {
+      role: "user",
+      content: `Your last reply contained a tool call that could not be parsed (${reason}). Reply again with only the corrected tool call(s), nothing else, in exactly this format:\n${spec.example}`,
+    },
+  ];
+}
 
-  // Applies parser events and returns the ones the client should see.
-  const apply = (events) => {
-    const visible = [];
-    for (const event of events) {
-      if (finished) {
-        break;
-      }
-      if (event.type === "text") {
-        visible.push(event);
-      } else if (event.type === "tool_call") {
-        stats.toolCalls += 1;
-        visible.push(event);
-      } else if (event.type === "stop") {
-        finished = true;
-      } else if (event.type === "invalid") {
-        if (stats.toolCalls > 0) {
-          onEvent({ type: "dropped", reason: event.reason, outputs: [event.raw] });
+export const DEFAULT_REASONING_BUDGET = 32_000;
+
+// Parses VENICE_TOOL_REASONING_BUDGET: characters of reasoning allowed before
+// an answer starts; 0 turns the budget off.
+export function parseReasoningBudget(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return DEFAULT_REASONING_BUDGET;
+  }
+  const budget = Number(value.trim());
+  return Number.isFinite(budget) && budget >= 0 ? budget : DEFAULT_REASONING_BUDGET;
+}
+
+const BREVITY_NOTE = "[Keep your reasoning brief: answer or call a tool right away.]";
+
+// Same conversation with a note on the latest user turn. The note goes into
+// that turn rather than a new user message: two user turns in a row would
+// lose the first one on Venice's chat endpoint.
+function withNoteOnLastUserTurn(emulation, note) {
+  const messages = [...emulation.messages];
+  const lastUser = messages.findLastIndex((message) => message.role === "user");
+  if (lastUser !== -1) {
+    messages[lastUser] = { ...messages[lastUser], content: `${messages[lastUser].content}\n\n${note}` };
+  }
+  return messages;
+}
+
+// The retry after a reasoning overrun: a nudge to be brief.
+export function buildOverrunRetryMessages(emulation) {
+  return withNoteOnLastUserTurn(emulation, BREVITY_NOTE);
+}
+
+// The retry after an empty reply. Seen live with Qwen 3.5+ on <proxy_call>: the
+// model fell back to its native <tool_call>, which Venice strips upstream, so
+// nothing arrived. The note repeats the format the model must use.
+export function buildEmptyRetryMessages(emulation) {
+  const spec = TOOL_FORMATS[emulation.format] ?? TOOL_FORMATS.json;
+  const tag = spec.tag ?? "tool_call";
+  return withNoteOnLastUserTurn(
+    emulation,
+    `[Your last reply arrived empty: any tool call in it did not come through. Answer, or call a tool in exactly this format, with <${tag}> tags:\n${spec.example}]`,
+  );
+}
+
+// Runs one emulated completion. openAttempt(messages) returns an async
+// iterable of upstream events { type: "meta" | "reasoning" | "content" };
+// leaving it early must cancel the upstream request. Yields client events
+// { type: "meta" | "reasoning" | "text" | "tool_call" | "error" }.
+//
+// Reading stops as soon as the reply is complete, so the model cannot go on
+// with "let me fix that". One retry covers two failures, before anything
+// about them reaches the client:
+// - an unparsed call block (before any call): the model gets its raw reply
+//   back with a correction; text from that retry is not shown, and if it fails
+//   too the original block comes back as text;
+// - a reasoning overrun: more than reasoningBudget characters of reasoning
+//   before any answer text or call. The request is cancelled and asked again
+//   with a nudge to be brief; if that overruns as well, an "error" event ends
+//   the reply instead of waiting for the upstream timeout.
+// onEvent reports "retry", "overrun", "failed" and "dropped" for logging.
+export async function* runToolEmulation({
+  emulation,
+  openAttempt,
+  onEvent = () => {},
+  stats = {},
+  reasoningBudget = DEFAULT_REASONING_BUDGET,
+}) {
+  stats.attempts = 0;
+  stats.toolCalls = 0;
+  let messages = emulation.messages;
+  let firstFailure = null;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const retrying = attempt > 0;
+    // Text from a correction retry is hidden; after an overrun or an empty
+    // reply nothing was answered yet, so the retry's text is the answer.
+    const showText = !retrying || firstFailure?.overrun || firstFailure?.empty;
+    stats.attempts = attempt + 1;
+    const parser = createToolCallParser(emulation.tools, { maxCalls: emulation.maxCalls });
+    let output = "";
+    let reasoningChars = 0;
+    let answerStarted = false;
+    let failure = null;
+    let finished = false;
+
+    // Whitespace-only text is held until real text follows, so an empty
+    // reply that gets retried sends nothing.
+    let blank = "";
+
+    // Applies parser events and returns the ones the client should see.
+    const apply = (events) => {
+      const visible = [];
+      for (const event of events) {
+        if (finished || failure) {
+          break;
+        }
+        if (event.type === "text") {
+          if (!event.text.trim()) {
+            blank += event.text;
+          } else if (showText) {
+            visible.push({ type: "text", text: blank + event.text });
+            blank = "";
+          }
+        } else if (event.type === "tool_call") {
+          stats.toolCalls += 1;
+          visible.push(event);
+        } else if (event.type === "stop") {
           finished = true;
-        } else {
-          onEvent({ type: "unparsed", reason: event.reason, outputs: [event.raw] });
-          visible.push({ type: "text", text: event.raw });
+        } else if (event.type === "invalid") {
+          if (stats.toolCalls > 0) {
+            onEvent({ type: "dropped", reason: event.reason, outputs: [output] });
+            finished = true;
+          } else {
+            failure = event;
+          }
         }
       }
-    }
-    return visible;
-  };
+      return visible;
+    };
 
-  for await (const event of openAttempt(emulation.messages)) {
-    if (event.type === "content") {
-      yield* apply(parser.push(event.text));
-      if (finished) {
-        break;
+    for await (const event of openAttempt(messages)) {
+      if (event.type === "content") {
+        output += event.text;
+        answerStarted ||= event.text.trim() !== "";
+        yield* apply(parser.push(event.text));
+        if (finished || failure) {
+          break;
+        }
+      } else if (event.type === "reasoning") {
+        yield event;
+        if (!answerStarted && reasoningBudget > 0) {
+          reasoningChars += event.text.length;
+          if (reasoningChars > reasoningBudget) {
+            failure = {
+              overrun: true,
+              reason: `reasoning passed ${reasoningBudget} characters without an answer`,
+              raw: "",
+            };
+            break;
+          }
+        }
+      } else if (event.type === "meta" && !retrying) {
+        yield event;
       }
-    } else if (event.type === "reasoning" || event.type === "meta") {
-      yield event;
     }
-  }
-  if (!finished) {
-    yield* apply(parser.end());
+    if (!finished && !failure) {
+      yield* apply(parser.end());
+    }
+
+    if (stats.toolCalls > 0) {
+      return;
+    }
+    const empty = !failure && !output.trim();
+    if (!failure && !empty && blank && showText) {
+      // Trailing whitespace of a real answer.
+      yield { type: "text", text: blank };
+    }
+    if (!failure && !empty) {
+      if (!retrying || firstFailure.overrun || firstFailure.empty) {
+        return;
+      }
+      failure = { reason: "the retry contained no tool call", raw: output };
+    }
+    if (empty && !retrying) {
+      failure = { empty: true, reason: "the reply was empty", raw: "" };
+    } else if (empty) {
+      // Nothing arrived twice: report it and end with the empty reply.
+      onEvent({ type: "failed", reason: `${firstFailure.reason}; retry: the reply was empty`, outputs: [firstFailure.output].filter(Boolean) });
+      if (blank && showText) {
+        yield { type: "text", text: blank };
+      }
+      return;
+    }
+    if (!retrying) {
+      firstFailure = { ...failure, output };
+      if (failure.overrun) {
+        onEvent({ type: "overrun", reason: failure.reason, outputs: [] });
+        messages = buildOverrunRetryMessages(emulation);
+      } else if (failure.empty) {
+        onEvent({ type: "empty", reason: failure.reason, outputs: [] });
+        messages = buildEmptyRetryMessages(emulation);
+      } else {
+        onEvent({ type: "retry", reason: failure.reason, outputs: [output] });
+        messages = buildRetryMessages(emulation, output, failure.reason);
+      }
+      continue;
+    }
+    onEvent({
+      type: "failed",
+      reason: `${firstFailure.reason}; retry: ${failure.reason}`,
+      outputs: [firstFailure.output, output].filter(Boolean),
+    });
+    const fallback = firstFailure.raw || failure.raw;
+    if (fallback) {
+      yield { type: "text", text: fallback };
+    } else {
+      yield {
+        type: "error",
+        code: "reasoning_budget_exceeded",
+        message: `The model kept reasoning past ${reasoningBudget} characters without answering, twice; the request was stopped instead of waiting for the upstream timeout. Set VENICE_TOOL_REASONING_BUDGET to change the limit (0 disables it).`,
+      };
+    }
+    return;
   }
 }
